@@ -329,16 +329,14 @@ const verifyOtp = async (userId, phone, code) => {
   authLog('OTP_VERIFICATION_START', userId, phone, { accountId });
 
   try {
-    // High-level signIn method handles the process
-    await client.signIn({
-      phoneNumber: phone,
-      phoneCodeHash: phoneCodeHash,
-      phoneCode: code,
-      onError: (err) => {
-        if (err.message.includes('SESSION_PASSWORD_NEEDED')) return false; // Handled by catch
-        return true;
-      }
-    });
+    // Use low-level API call instead of client.signIn (not available in this gramjs version)
+    await client.invoke(
+      new Api.auth.SignIn({
+        phoneNumber: phone,
+        phoneCodeHash: phoneCodeHash,
+        phoneCode: code.trim(),
+      })
+    );
 
     const me = await client.getMe();
     const sessionString = session.save();
@@ -392,10 +390,11 @@ const verifyPassword = async (userId, phone, password) => {
   authLog('2FA_VERIFICATION_START', userId, phone, { accountId });
 
   try {
-    await client.signIn({
-      phoneNumber: phone,
-      password: async () => password,
-    });
+    // Use low-level 2FA password check
+    const passwordInfo = await client.invoke(new Api.account.GetPassword());
+    const { computeCheck } = require('telegram/Password');
+    const passwordCheck = await computeCheck(passwordInfo, password);
+    await client.invoke(new Api.auth.CheckPassword({ password: passwordCheck }));
 
     const me = await client.getMe();
     const sessionString = session.save();
