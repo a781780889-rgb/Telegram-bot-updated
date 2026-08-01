@@ -246,6 +246,10 @@ const sendOtp = async (userId, phone, accountId, { skipThrottle = false } = {}) 
   }
 
   const channel = result.isCodeViaApp ? 'telegram-app' : 'sms/call';
+  // Handle both gramjs result structures
+  const phoneCodeHash = result.phoneCodeHash || result?.phoneCode?.phoneCodeHash;
+  logger.info(`[AUTH] sendCode hash=${phoneCodeHash?.slice(0,8)}... channel=${channel}`);
+  
   authLog('OTP_REQUESTED_SUCCESS', userId, phone, { 
     channel, 
     accountId, 
@@ -256,7 +260,7 @@ const sendOtp = async (userId, phone, accountId, { skipThrottle = false } = {}) 
   pendingSessions.set(key, {
     client,
     session,
-    phoneCodeHash:      result.phoneCodeHash,
+    phoneCodeHash:      phoneCodeHash,
     isCodeViaApp:       result.isCodeViaApp,
     isPasswordRequired: false,
     phone,
@@ -329,12 +333,15 @@ const verifyOtp = async (userId, phone, code) => {
   authLog('OTP_VERIFICATION_START', userId, phone, { accountId });
 
   try {
-    // Use low-level API call instead of client.signIn (not available in this gramjs version)
+    // Use low-level API call - SignIn with phoneCodeHash from sendCode result
+    const cleanCode = String(code).replace(/\s+/g, '').trim();
+    logger.info(`[AUTH] verifyOtp using hash=${phoneCodeHash?.slice(0,8)}... code_len=${cleanCode.length}`);
+    
     await client.invoke(
       new Api.auth.SignIn({
         phoneNumber: phone,
         phoneCodeHash: phoneCodeHash,
-        phoneCode: code.trim(),
+        phoneCode: cleanCode,
       })
     );
 
