@@ -1,0 +1,27 @@
+{
+  "name": "telegram-account-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot for managing multiple Telegram accounts via phone number login",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "dependencies": {
+    "socks": "^2.8.1",
+    "telegraf": "^4.16.3",
+    "telegram": "^2.26.22",
+    "better-sqlite3": "^9.4.3",
+    "dotenv": "^16.4.5",
+    "winston": "^3.13.0",
+    "crypto-js": "^4.2.0",
+    "input": "^1.0.1",
+    "big-integer": "^1.6.52"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

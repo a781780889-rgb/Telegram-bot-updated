@@ -1,0 +1,55 @@
+# ==========================================
+# Telegram Bot Configuration
+# ==========================================
+
+# Bot Token from @BotFather
+BOT_TOKEN=your_bot_token_here
+
+# Telegram API credentials from https://my.telegram.org
+API_ID=your_api_id_here
+API_HASH=your_api_hash_here
+
+# ==========================================
+# Security
+# ==========================================
+
+# Encryption key for sessions (min 32 chars, random string)
+ENCRYPTION_KEY=your_very_long_random_encryption_key_here_32chars
+
+# ==========================================
+# Database & Sessions — PERSISTENCE NOTICE
+# ==========================================
+#
+# ⚠️  IMPORTANT for Railway / Docker / any cloud deployment:
+#
+# Both DB_PATH and SESSIONS_DIR MUST point to a persistent volume.
+# If they point to the container's ephemeral filesystem, all accounts
+# and sessions will be lost on every deployment or restart.
+#
+# Railway example (attach a volume mounted at /data):
+#   DB_PATH=/data/accounts.db
+#   SESSIONS_DIR=/data/sessions
+#
+# Note: The session restore service automatically recreates missing session
+# files from the database, so the database file is the most critical.
+
+DB_PATH=./data/accounts.db
+SESSIONS_DIR=./sessions
+
+# ==========================================
+# Logging
+# ==========================================
+
+LOG_LEVEL=info
+LOG_DIR=./logs
+
+# ==========================================
+# Proxy Configuration (Highly Recommended for Railway)
+# ==========================================
+# Telegram often blocks cloud IPs for login requests. 
+# Using a SOCKS5 proxy is the best way to ensure the login code arrives.
+
+PROXY_HOST=
+PROXY_PORT=
+PROXY_USER=
+PROXY_PASS=
