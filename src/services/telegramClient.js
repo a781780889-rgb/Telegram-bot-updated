@@ -18,7 +18,8 @@ const { encrypt, decrypt, maskPhone } = require('../utils/encryption');
 
 // ─── Directory bootstrap ──────────────────────────────────────────────────────
 
-const sessionsDir = process.env.SESSIONS_DIR || './sessions';
+const persistentRoot = process.env.PERSISTENT_DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH;
+const sessionsDir = process.env.SESSIONS_DIR || (persistentRoot ? path.join(persistentRoot, 'sessions') : './sessions');
 if (!fs.existsSync(sessionsDir)) {
   fs.mkdirSync(sessionsDir, { recursive: true });
 }

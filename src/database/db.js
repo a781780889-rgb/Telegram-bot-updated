@@ -3,7 +3,8 @@ const path = require('path');
 const fs = require('fs');
 const logger = require('../utils/logger');
 
-const dbPath = process.env.DB_PATH || './data/accounts.db';
+const persistentRoot = process.env.PERSISTENT_DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH;
+const dbPath = process.env.DB_PATH || (persistentRoot ? path.join(persistentRoot, 'accounts.db') : './data/accounts.db');
 const dbDir = path.dirname(dbPath);
 
 if (!fs.existsSync(dbDir)) {

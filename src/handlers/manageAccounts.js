@@ -31,6 +31,8 @@ const {
   otpRequestMessage,
 } = require('../utils/messages');
 
+const resolveSessionFile = (account) => telegramClient.restoreSessionFile(account) || account.session_file;
+
 // ─── Helper: safe edit/reply ──────────────────────────────────────────────────
 
 /**
@@ -248,12 +250,13 @@ const handleCheckStatus = async (ctx, accountId) => {
 
     let isAlive = false;
 
-    if (account.session_file) {
+    const sessionFile = resolveSessionFile(account);
+    if (sessionFile) {
       try {
-        const client = await telegramClient.loadSession(account.session_file);
+        const client = await telegramClient.loadSession(sessionFile);
         isAlive = true;
         telegramClient.registerActiveClient(accountId, client, account.phone);
-        accountQueries.updateStatus(accountId, 'connected', { error_message: null });
+        accountQueries.updateStatus(accountId, 'connected', { error_message: null, session_file: sessionFile });
       } catch (sessionError) {
         logger.warn(`Session check failed for account ${accountId}:`, sessionError);
         accountQueries.updateStatus(accountId, 'disconnected', {
@@ -311,12 +314,13 @@ const handleRefreshAllStatus = async (ctx) => {
       let isAlive = false;
       let errorMsg = null;
 
-      if (account.session_file) {
+      const sessionFile = resolveSessionFile(account);
+      if (sessionFile) {
         try {
-          const client = await telegramClient.loadSession(account.session_file);
+          const client = await telegramClient.loadSession(sessionFile);
           isAlive = true;
           telegramClient.registerActiveClient(account.id, client, account.phone);
-          accountQueries.updateStatus(account.id, 'connected', { error_message: null });
+          accountQueries.updateStatus(account.id, 'connected', { error_message: null, session_file: sessionFile });
         } catch (err) {
           errorMsg = err.message;
           accountQueries.updateStatus(account.id, 'disconnected', {
