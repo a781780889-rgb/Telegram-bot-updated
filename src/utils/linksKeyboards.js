@@ -90,22 +90,11 @@ const linksTelegramSubtypeKeyboard = (selected = []) => {
  * @param {string[]} selected
  */
 const linksWhatsappSubtypeKeyboard = (selected = []) => {
-  const isAll = selected.includes('all');
-
-  const _btn = (label, value) => {
-    const active = isAll ? value === 'all' : selected.includes(value);
-    return Markup.button.callback(`${active ? '✅' : '◻️'} ${label}`, `links_wasub_${value}`);
-  };
-
-  // Determine back button: if 'both' mode came before, back goes to telegram subtype
+  // WhatsApp search is intentionally limited to public group invite links.
   return Markup.inlineKeyboard([
-    [_btn('مجموعات واتساب', 'group')],
-    [_btn('قنوات واتساب', 'channel')],
-    [_btn('الكل', 'all')],
-    [
-      Markup.button.callback('✅ تأكيد', 'links_wasub_confirm'),
-      Markup.button.callback('⬅️ رجوع', 'links_back_to_step3a'),
-    ],
+    [Markup.button.callback('✅ مجموعات واتساب العامة فقط', 'links_wasub_group')],
+    [Markup.button.callback('✅ تأكيد', 'links_wasub_confirm')],
+    [Markup.button.callback('⬅️ رجوع', 'links_back_to_step3a')],
   ]);
 };
 

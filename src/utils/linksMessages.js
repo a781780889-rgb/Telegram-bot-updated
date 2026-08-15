@@ -327,10 +327,7 @@ const _tgSubLabel = (subs, linkType) => {
 
 const _waSubLabel = (subs, linkType) => {
   if (!linkType || linkType === 'telegram') return null;
-  if (!subs || !subs.length) return '—';
-  if (subs.includes('all')) return 'الكل';
-  const map = { group: 'مجموعات', channel: 'قنوات' };
-  return subs.map((v) => map[v] || v).join(' + ');
+  return 'مجموعات واتساب العامة فقط';
 };
 
 const _periodLabel = (wizard) => {

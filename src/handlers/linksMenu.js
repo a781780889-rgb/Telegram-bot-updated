@@ -226,7 +226,8 @@ const _setLinkType = async (ctx, type) => {
   wizardState.setWizardState(uid, {
     linkType: type,
     telegramSubTypes: [],
-    whatsappSubTypes: [],
+    // WhatsApp is always restricted to public group invite links.
+    whatsappSubTypes: ['group'],
     step: nextStep,
   });
 
@@ -236,10 +237,11 @@ const _setLinkType = async (ctx, type) => {
       ...linksTelegramSubtypeKeyboard([]),
     });
   } else {
-    // whatsapp only
-    await safeEdit(ctx, linksStepWhatsappSubtypeMessage, {
+    // WhatsApp-only searches go directly to the period step.
+    wizardState.setWizardState(uid, { whatsappSubTypes: ['group'], step: WIZARD_STEPS.SELECT_PERIOD });
+    await safeEdit(ctx, linksStep3Message, {
       parse_mode: 'Markdown',
-      ...linksWhatsappSubtypeKeyboard([]),
+      ...linksSelectPeriodKeyboard(),
     });
   }
   await ack(ctx);
@@ -298,9 +300,10 @@ const handleLinksTgSubConfirm = async (ctx) => {
   wizardState.setWizardState(uid, { step: nextStep });
 
   if (nextStep === WIZARD_STEPS.SELECT_WHATSAPP_SUBTYPE) {
-    await safeEdit(ctx, linksStepWhatsappSubtypeMessage, {
+    wizardState.setWizardState(uid, { whatsappSubTypes: ['group'] });
+    await safeEdit(ctx, linksStep3Message, {
       parse_mode: 'Markdown',
-      ...linksWhatsappSubtypeKeyboard(wiz.whatsappSubTypes || []),
+      ...linksSelectPeriodKeyboard(),
     });
   } else {
     // Go to period
@@ -317,20 +320,8 @@ const handleLinksTgSubConfirm = async (ctx) => {
 const handleLinksWaSubToggle = async (ctx, value) => {
   const uid = userId(ctx);
   const wiz = wizardState.getWizardState(uid);
-  let selected = [...(wiz.whatsappSubTypes || [])];
-
-  if (value === 'all') {
-    selected = selected.includes('all') ? [] : ['all'];
-  } else {
-    selected = selected.filter((v) => v !== 'all');
-    const idx = selected.indexOf(value);
-    if (idx === -1) {
-      selected.push(value);
-    } else {
-      selected.splice(idx, 1);
-    }
-  }
-
+  // Ignore legacy channel/all callbacks and keep the backend contract strict.
+  const selected = ['group'];
   wizardState.setWizardState(uid, { whatsappSubTypes: selected });
   await safeEdit(ctx, linksStepWhatsappSubtypeMessage, {
     parse_mode: 'Markdown',
@@ -342,11 +333,7 @@ const handleLinksWaSubToggle = async (ctx, value) => {
 const handleLinksWaSubConfirm = async (ctx) => {
   const uid = userId(ctx);
   const wiz = wizardState.getWizardState(uid);
-
-  if (!wiz.whatsappSubTypes || !wiz.whatsappSubTypes.length) {
-    await ctx.answerCbQuery('⚠️ يرجى اختيار نوع واحد على الأقل', { show_alert: true });
-    return;
-  }
+  wizardState.setWizardState(uid, { whatsappSubTypes: ['group'] });
 
   wizardState.setWizardState(uid, { step: WIZARD_STEPS.SELECT_PERIOD });
   await safeEdit(ctx, linksStep3Message, {

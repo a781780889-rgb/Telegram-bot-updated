@@ -13,7 +13,8 @@ const { linksOperationQueries, linksFoundQueries, linksSettingsQueries } = requi
 // ─── Link Patterns ────────────────────────────────────────────────────────────
 
 const TELEGRAM_PATTERN = /(?:https?:\/\/)?(?:t(?:elegram)?\.me|telegram\.org)\/[^\s<>"']+/gi;
-const WHATSAPP_PATTERN = /(?:https?:\/\/)?(?:wa\.me|chat\.whatsapp\.com|api\.whatsapp\.com\/send)\/[^\s<>"']*/gi;
+// Public WhatsApp group invite links only. wa.me, message, phone, and API links are excluded.
+const WHATSAPP_GROUP_PATTERN = /(?:https?:\/\/)?chat\.whatsapp\.com\/[A-Za-z0-9_-]{10,}/gi;
 
 /**
  * Extract links from text
@@ -34,7 +35,7 @@ const extractLinks = (text, linkType = 'both') => {
   }
 
   if (linkType === 'both' || linkType === 'whatsapp') {
-    const waMatches = text.match(WHATSAPP_PATTERN) || [];
+    const waMatches = text.match(WHATSAPP_GROUP_PATTERN) || [];
     waMatches.forEach((url) => {
       const clean = url.replace(/[.,;!?)]+$/, '').trim();
       if (clean.length > 5) found.push({ url: clean, type: 'whatsapp' });
