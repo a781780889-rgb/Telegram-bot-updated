@@ -142,6 +142,7 @@ const {
   handlePublishLogs,
 } = require('./handlers/publishMenu');
 const { startPublishScheduler } = require('./services/publishService');
+const userCodes = require('./handlers/userCodes');
 
 const { restoreAllAccounts } = require('./services/sessionRestoreService');
 
@@ -192,6 +193,17 @@ bot.command('menu', async (ctx) => {
 
 bot.action('main_menu', handleMainMenu);
 bot.action('help', handleHelp);
+bot.action('use_code', userCodes.handleUseCodeStart);
+bot.action('codes_menu', userCodes.handleCodesMenu);
+bot.action('codes_create', userCodes.handleCreateStart);
+bot.action('codes_batch', userCodes.handleBatchStart);
+bot.action('codes_list', userCodes.handleCodesList);
+bot.action('codes_search', userCodes.handleCodesSearch);
+bot.action('codes_stats', userCodes.handleCodesStats);
+bot.action('codes_export', userCodes.handleCodesExport);
+bot.action(/^code_disable_(\d+)$/, userCodes.handleCodeDisable);
+bot.action(/^code_enable_(\d+)$/, userCodes.handleCodeEnable);
+bot.action(/^code_delete_(\d+)$/, userCodes.handleCodeDelete);
 bot.action('accounts_menu', handleAccountsMenu);
 
 // ─── Links Section Callbacks ──────────────────────────────────────────────────
