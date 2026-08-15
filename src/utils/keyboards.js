@@ -5,17 +5,22 @@ const { Markup } = require('telegraf');
 /**
  * Main menu keyboard — all account actions are nested under "accounts_menu"
  */
-const mainMenuKeyboard = () =>
-  Markup.inlineKeyboard([
+const mainMenuKeyboard = (telegramUserId) => {
+  const rows = [
     [Markup.button.callback('🚀 محرك النشر', 'publish_menu')],
     [Markup.button.callback('📂 الحسابات', 'accounts_menu')],
     [Markup.button.callback('🎟️ استخدام كود', 'use_code')],
-    [Markup.button.callback('🛠️ لوحة إدارة الأكواد', 'codes_menu')],
     [Markup.button.callback('🔗 الروابط', 'links_menu')],
     [Markup.button.callback('🔗 الانضمام للروابط', 'join_menu')],
     [Markup.button.callback('📁 قاعدة البيانات والمجلدات', 'folders_menu')],
     [Markup.button.callback('ℹ️ المساعدة', 'help')],
-  ]);
+  ];
+  const admins = new Set(String(process.env.ADMIN_TELEGRAM_IDS || '').split(',').map((id) => id.trim()).filter(Boolean));
+  if (telegramUserId !== undefined && admins.has(String(telegramUserId))) {
+    rows.splice(3, 0, [Markup.button.callback('🛠️ لوحة إدارة الأكواد', 'codes_menu')]);
+  }
+  return Markup.inlineKeyboard(rows);
+};
 
 // ─── Account Management Menu ──────────────────────────────────────────────────
 

@@ -47,7 +47,7 @@ const textRouter = async (ctx, next) => {
     }
     await ctx.reply(
       '⏱ انتهت مهلة الجلسة. ابدأ من جديد.',
-      mainMenuKeyboard()
+      mainMenuKeyboard(ctx.from?.id)
     );
     return;
   }
@@ -100,7 +100,7 @@ const textRouter = async (ctx, next) => {
       // Unexpected text while idle
       await ctx.reply(
         'استخدم القائمة للتنقل بين الخيارات.',
-        mainMenuKeyboard()
+        mainMenuKeyboard(ctx.from?.id)
       );
       break;
   }

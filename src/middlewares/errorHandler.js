@@ -19,10 +19,10 @@ const errorHandler = (err, ctx) => {
     if (ctx?.callbackQuery) {
       ctx.answerCbQuery('حدث خطأ').catch(() => {});
       ctx
-        .reply(errorMessage, mainMenuKeyboard())
+        .reply(errorMessage, mainMenuKeyboard(ctx?.from?.id))
         .catch(() => {});
     } else if (ctx?.message) {
-      ctx.reply(errorMessage, mainMenuKeyboard()).catch(() => {});
+      ctx.reply(errorMessage, mainMenuKeyboard(ctx?.from?.id)).catch(() => {});
     }
   } catch (_) {
     // Suppress secondary errors in error handler

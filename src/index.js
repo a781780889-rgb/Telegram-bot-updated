@@ -186,7 +186,7 @@ bot.command('debug', async (ctx) => {
   await ctx.reply(`🔍 *معلومات التصحيح:*\n\n🆔 معرفك: \`${userId}\`\n⚙️ الحالة: متصل ويعمل`, { parse_mode: 'Markdown' });
 });
 bot.command('menu', async (ctx) => {
-  await ctx.reply('القائمة الرئيسية:', require('./utils/keyboards').mainMenuKeyboard());
+  await ctx.reply('القائمة الرئيسية:', require('./utils/keyboards').mainMenuKeyboard(ctx.from?.id));
 });
 
 // ─── Navigation Callbacks ─────────────────────────────────────────────────────
