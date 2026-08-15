@@ -24,6 +24,7 @@ const adminMenuKeyboard = () => Markup.inlineKeyboard([
   [Markup.button.callback('🔎 بحث عن كود', 'codes_search')],
   [Markup.button.callback('📊 الإحصائيات', 'codes_stats')],
   [Markup.button.callback('📤 تصدير الأكواد', 'codes_export')],
+  [Markup.button.callback('📁 ملفات نتائج البحث', 'admin_result_files')],
   [Markup.button.callback('👥 المستخدمون المفعلون', 'activated_users')],
   [Markup.button.callback('🚫 المستخدمون غير المفعلين', 'inactive_users')],
   [Markup.button.callback('🏠 الرئيسية', 'main_menu')],

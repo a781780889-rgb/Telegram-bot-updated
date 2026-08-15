@@ -2,16 +2,20 @@ const { Markup } = require('telegraf');
 
 // ─── Links Main Menu ──────────────────────────────────────────────────────────
 
-const linksMenuKeyboard = () =>
-  Markup.inlineKeyboard([
+const linksMenuKeyboard = (userId) => {
+  const adminIds = new Set(String(process.env.ADMIN_TELEGRAM_IDS || '').split(',').map((value) => value.trim()).filter(Boolean));
+  const rows = [
     [Markup.button.callback('🔍 بدء البحث عن الروابط', 'links_start_search')],
     [Markup.button.callback('📂 الملفات المستخرجة', 'links_extracted_files')],
     [Markup.button.callback('📊 الإحصائيات', 'links_statistics')],
     [Markup.button.callback('⚙️ إعدادات البحث', 'links_settings')],
     [Markup.button.callback('🗑 تنظيف الملفات', 'links_clean_files')],
     [Markup.button.callback('📜 سجل عمليات البحث', 'links_history')],
-    [Markup.button.callback('⬅️ رجوع', 'main_menu')],
-  ]);
+  ];
+  if (adminIds.has(String(userId))) rows.push([Markup.button.callback('📁 ملفات نتائج البحث', 'admin_result_files')]);
+  rows.push([Markup.button.callback('⬅️ رجوع', 'main_menu')]);
+  return Markup.inlineKeyboard(rows);
+};
 
 // ─── Step 1: Account Selection ────────────────────────────────────────────────
 

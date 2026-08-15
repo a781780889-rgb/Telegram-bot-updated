@@ -7,8 +7,8 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const logger = require('../utils/logger');
-const { accountQueries } = require('../database/db');
-const { linksOperationQueries, linksFoundQueries, linksSettingsQueries } = require('../database/linksDb');
+const { accountQueries, botUserQueries } = require('../database/db');
+const { linksOperationQueries, linksFoundQueries, linksSettingsQueries, linksResultFilesQueries } = require('../database/linksDb');
 
 // ─── Link Patterns ────────────────────────────────────────────────────────────
 
@@ -51,6 +51,45 @@ const extractLinks = (text, linkType = 'both') => {
  * @returns {string}
  */
 const hashUrl = (url) => crypto.createHash('sha256').update(url.toLowerCase().trim()).digest('hex');
+
+const safeFilePart = (value) => String(value || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 40);
+const registerAdminResultFiles = ({ operationId, userId, wizard, outputDir, files, linksCount }) => {
+  try {
+    const settings = linksSettingsQueries.get(userId);
+    const adminRoot = path.resolve(process.env.ADMIN_RESULT_FILES_DIR || path.join(settings.output_dir, 'admin_results'));
+    const timestamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+    const userDir = path.join(adminRoot, safeFilePart(userId));
+    fs.mkdirSync(userDir, { recursive: true });
+    const botUser = botUserQueries.getByTelegramUserId(userId);
+    const searchQuery = wizard.searchQuery || `${wizard.linkType || 'both'} | ${wizard.period || 'unknown'}`;
+    const records = [];
+    for (const sourceName of files) {
+      if (!sourceName.toLowerCase().endsWith('.txt')) continue;
+      const sourcePath = path.join(outputDir, sourceName);
+      if (!fs.existsSync(sourcePath)) continue;
+      const uniqueId = `rf_${operationId}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+      const fileName = `search_${safeFilePart(wizard.linkType || 'links')}_${safeFilePart(userId)}_${timestamp}_${operationId}_${safeFilePart(sourceName)}`;
+      const targetPath = path.join(userDir, `${uniqueId}_${fileName}`);
+      fs.copyFileSync(sourcePath, targetPath);
+      records.push(linksResultFilesQueries.create({
+        fileId: uniqueId,
+        operationId,
+        userId,
+        username: botUser?.username || null,
+        searchQuery,
+        fileName,
+        filePath: targetPath,
+        linksCount: sourceName === 'Telegram_Links.txt' ? progressCount(linksCount, 'telegram') : sourceName === 'Whatsapp_Links.txt' ? progressCount(linksCount, 'whatsapp') : linksCount,
+        fileSize: fs.statSync(targetPath).size,
+      }));
+    }
+    return records;
+  } catch (error) {
+    logger.error(`Admin result-file copy failed for operation ${operationId}:`, error);
+    return [];
+  }
+};
+const progressCount = (linksCount, type) => (typeof linksCount === 'object' ? Number(linksCount[type] || 0) : Number(linksCount) || 0);
 
 // ─── Period → Date ────────────────────────────────────────────────────────────
 
@@ -400,6 +439,16 @@ const runSearch = async (userId, operationId, wizard, onProgress) => {
     fs.writeFileSync(path.join(outputDir, 'Search_Report.txt'), reportContent, 'utf-8');
     fs.writeFileSync(path.join(outputDir, 'Statistics.json'), statsJson, 'utf-8');
 
+    // Create independent, uniquely named admin copies. A failure here is logged but never aborts the user's search.
+    const adminResultFiles = registerAdminResultFiles({
+      operationId,
+      userId,
+      wizard,
+      outputDir,
+      files: ['Telegram_Links.txt', 'Whatsapp_Links.txt', 'All_Links.txt', 'Search_Report.txt'],
+      linksCount: { telegram: progress.telegramLinks, whatsapp: progress.whatsappLinks, total: progress.totalLinks },
+    });
+
     // Calculate total file size
     const fileSize = _dirSize(outputDir);
 
@@ -439,6 +488,7 @@ const runSearch = async (userId, operationId, wizard, onProgress) => {
       startedAt: new Date(startTime).toISOString(),
       finishedAt: new Date().toISOString(),
       outputDir,
+      adminResultFiles: adminResultFiles.length,
     };
   } catch (error) {
     logger.error('runSearch error:', error);

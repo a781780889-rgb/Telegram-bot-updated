@@ -16,11 +16,13 @@ const fs   = require('fs');
 const path = require('path');
 const logger = require('../utils/logger');
 const { accountQueries } = require('../database/db');
+const { isAdmin } = require('./userCodes');
 const {
   linksOperationQueries,
   linksFoundQueries,
   linksStatsQueries,
   linksSettingsQueries,
+  linksResultFilesQueries,
 } = require('../database/linksDb');
 const linksService = require('../services/linksService');
 const wizardState  = require('../services/linksWizardState');
@@ -105,7 +107,7 @@ const handleLinksMenu = async (ctx) => {
     wizardState.resetWizard(userId(ctx));
     await safeEdit(ctx, linksMenuMessage, {
       parse_mode: 'Markdown',
-      ...linksMenuKeyboard(),
+      ...linksMenuKeyboard(userId(ctx)),
     });
     await ack(ctx);
   } catch (error) {
@@ -605,6 +607,75 @@ const handleLinksBackToStep5 = async (ctx) => {
   await ack(ctx);
 };
 
+// ─── Administrator Result Files ───────────────────────────────────────────────
+
+const adminResultRoot = (record) => path.resolve(process.env.ADMIN_RESULT_FILES_DIR || path.join(linksSettingsQueries.get(record.user_id).output_dir, 'admin_results'));
+const safeAdminFilePath = (record) => {
+  if (!record?.file_path) return null;
+  const root = `${adminResultRoot(record)}${path.sep}`;
+  const target = path.resolve(record.file_path);
+  return target.startsWith(root) ? target : null;
+};
+const adminResultFilesKeyboard = (rows) => require('telegraf').Markup.inlineKeyboard([
+  ...rows.slice(0, 20).map((row) => [require('telegraf').Markup.button.callback(`📄 ${row.file_name.slice(0, 38)}`, `admin_result_file_${row.file_id}`)]),
+  [require('telegraf').Markup.button.callback('🔎 بحث داخل الملفات', 'admin_result_search')],
+  [require('telegraf').Markup.button.callback('🔄 تحديث', 'admin_result_files')],
+  [require('telegraf').Markup.button.callback('⬅️ الرئيسية', 'links_menu')],
+]);
+const formatAdminResult = (row) => `📄 *${row.file_name}*\n👤 المستخدم: ${row.username ? `@${row.username}` : 'بدون اسم'}\n🆔 Telegram User ID: ${row.user_id}\n🔍 البحث: ${row.search_query || row.operation_name || '—'}\n🔗 الروابط: ${row.links_count}\n📅 الإنشاء: ${row.created_at}\n📊 الحجم: ${row.file_size} بايت\n📌 الحالة: ${row.status}`;
+
+const handleAdminResultFiles = async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('غير مصرح.', { show_alert: true });
+  const rows = linksResultFilesQueries.list({ limit: 20 });
+  await ctx.answerCbQuery();
+  await safeEdit(ctx, rows.length ? `📁 *ملفات نتائج البحث*\n\nإجمالي الملفات المعروضة: ${rows.length}` : '📁 *ملفات نتائج البحث*\n\nلا توجد ملفات نتائج محفوظة بعد.', { parse_mode: 'Markdown', ...adminResultFilesKeyboard(rows) });
+};
+const handleAdminResultFile = async (ctx, fileId) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('غير مصرح.', { show_alert: true });
+  const row = linksResultFilesQueries.getById(fileId);
+  const storedPath = safeAdminFilePath(row);
+  if (!row || !storedPath || !fs.existsSync(storedPath)) {
+    if (row) linksResultFilesQueries.markMissing(fileId);
+    return ctx.answerCbQuery('الملف غير موجود.', { show_alert: true });
+  }
+  await ctx.answerCbQuery();
+  await safeEdit(ctx, formatAdminResult(row), { parse_mode: 'Markdown', ...require('telegraf').Markup.inlineKeyboard([
+    [require('telegraf').Markup.button.callback('👁️ معاينة', `admin_result_preview_${fileId}`), require('telegraf').Markup.button.callback('📥 تحميل', `admin_result_download_${fileId}`)],
+    [require('telegraf').Markup.button.callback('🗑 حذف', `admin_result_delete_${fileId}`)],
+    [require('telegraf').Markup.button.callback('⬅️ الملفات', 'admin_result_files')],
+  ]) });
+};
+const handleAdminResultPreview = async (ctx, fileId) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('غير مصرح.', { show_alert: true });
+  const row = linksResultFilesQueries.getById(fileId); const storedPath = safeAdminFilePath(row);
+  if (!row || !storedPath || !fs.existsSync(storedPath)) return ctx.answerCbQuery('الملف غير موجود.', { show_alert: true });
+  const content = fs.readFileSync(storedPath, 'utf8').slice(0, 3500) || '(الملف فارغ)';
+  await ctx.answerCbQuery();
+  await safeEdit(ctx, `${formatAdminResult(row)}\n\n📝 *المعاينة:*\n\n\`${content.replace(/`/g, "'")}\``, { parse_mode: 'Markdown', ...require('telegraf').Markup.inlineKeyboard([[require('telegraf').Markup.button.callback('⬅️ تفاصيل الملف', `admin_result_file_${fileId}`)]]) });
+};
+const handleAdminResultDownload = async (ctx, fileId) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('غير مصرح.', { show_alert: true });
+  const row = linksResultFilesQueries.getById(fileId); const storedPath = safeAdminFilePath(row);
+  if (!row || !storedPath || !fs.existsSync(storedPath)) return ctx.answerCbQuery('الملف غير موجود.', { show_alert: true });
+  await ctx.answerCbQuery('جارٍ تجهيز الملف...');
+  await ctx.replyWithDocument({ source: storedPath, filename: row.file_name });
+};
+const handleAdminResultDelete = async (ctx, fileId) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('غير مصرح.', { show_alert: true });
+  const row = linksResultFilesQueries.getById(fileId); const storedPath = safeAdminFilePath(row);
+  if (!row) return ctx.answerCbQuery('الملف غير موجود.', { show_alert: true });
+  if (storedPath && fs.existsSync(storedPath)) fs.rmSync(storedPath, { force: true });
+  linksResultFilesQueries.markDeleted(fileId);
+  await ctx.answerCbQuery('تم حذف الملف.');
+  await handleAdminResultFiles(ctx);
+};
+const handleAdminResultSearch = async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('غير مصرح.', { show_alert: true });
+  wizardState.setWizardState(userId(ctx), { step: 'ADMIN_RESULT_SEARCH' });
+  await ctx.answerCbQuery();
+  await ctx.reply('أرسل اسم الملف أو Telegram User ID أو اسم المستخدم أو كلمة البحث:');
+};
+
 // ─── Extracted Files ──────────────────────────────────────────────────────────
 
 const handleLinksExtractedFiles = async (ctx) => {
@@ -901,6 +972,14 @@ const handleLinksTextInput = async (ctx) => {
       break;
     }
 
+    case 'ADMIN_RESULT_SEARCH': {
+      if (!isAdmin(ctx)) return;
+      const rows = linksResultFilesQueries.list({ search: text, limit: 20 });
+      wizardState.resetWizard(uid);
+      await ctx.reply(rows.length ? `🔎 نتائج البحث:\n\n${rows.map(formatAdminResult).join('\n\n')}` : 'لا توجد ملفات مطابقة.', { parse_mode: 'Markdown', ...adminResultFilesKeyboard(rows) });
+      break;
+    }
+
     case WIZARD_STEPS.AWAITING_RENAME: {
       const targetId = wiz.renameTargetId;
       if (!targetId) {
@@ -980,6 +1059,12 @@ module.exports = {
   handleLinksBackToStep4,
   handleLinksBackToStep5,
   // Files
+  handleAdminResultFiles,
+  handleAdminResultFile,
+  handleAdminResultPreview,
+  handleAdminResultDownload,
+  handleAdminResultDelete,
+  handleAdminResultSearch,
   handleLinksExtractedFiles,
   handleLinksViewOperation,
   handleLinksDownloadOperation,

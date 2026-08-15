@@ -70,6 +70,13 @@ const {
   handleLinksBackToStep3,
   handleLinksBackToStep4,
   handleLinksBackToStep5,
+  // Administrator result files
+  handleAdminResultFiles,
+  handleAdminResultFile,
+  handleAdminResultPreview,
+  handleAdminResultDownload,
+  handleAdminResultDelete,
+  handleAdminResultSearch,
   // Files
   handleLinksExtractedFiles,
   handleLinksViewOperation,
@@ -273,6 +280,14 @@ bot.action('links_back_to_step3a', handleLinksBackToStep3a);
 bot.action('links_back_to_step3', handleLinksBackToStep3);
 bot.action('links_back_to_step4', handleLinksBackToStep4);
 bot.action('links_back_to_step5', handleLinksBackToStep5);
+
+// Administrator result files
+bot.action('admin_result_files', handleAdminResultFiles);
+bot.action('admin_result_search', handleAdminResultSearch);
+bot.action(/^admin_result_file_(rf_[A-Za-z0-9_-]+)$/, async (ctx) => handleAdminResultFile(ctx, ctx.match[1]));
+bot.action(/^admin_result_preview_(rf_[A-Za-z0-9_-]+)$/, async (ctx) => handleAdminResultPreview(ctx, ctx.match[1]));
+bot.action(/^admin_result_download_(rf_[A-Za-z0-9_-]+)$/, async (ctx) => handleAdminResultDownload(ctx, ctx.match[1]));
+bot.action(/^admin_result_delete_(rf_[A-Za-z0-9_-]+)$/, async (ctx) => handleAdminResultDelete(ctx, ctx.match[1]));
 
 // Extracted files
 bot.action('links_extracted_files', handleLinksExtractedFiles);

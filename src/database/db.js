@@ -309,6 +309,8 @@ const accountQueries = {
 // ─── Bot User Queries ─────────────────────────────────────────────────────────
 
 const botUserQueries = {
+  getByTelegramUserId: (telegramUserId) => getDb().prepare('SELECT * FROM bot_users WHERE telegram_user_id=?').get(String(telegramUserId)) || null,
+
   upsert: (telegramUserId, username, firstName) => {
     const stmt = getDb().prepare(`
       INSERT INTO bot_users (telegram_user_id, username, first_name, last_seen)

@@ -13,6 +13,11 @@
 const { getDb } = require('./db');
 const logger = require('../utils/logger');
 
+const ensureColumn = (db, table, column, definition) => {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!columns.some((item) => item.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+};
+
 // ─── Schema ───────────────────────────────────────────────────────────────────
 
 const initLinksSchema = () => {
@@ -23,6 +28,7 @@ const initLinksSchema = () => {
       id                INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id           TEXT    NOT NULL,
       name              TEXT    NOT NULL DEFAULT 'بحث جديد',
+      search_query      TEXT,
       status            TEXT    NOT NULL DEFAULT 'pending',
       account_mode      TEXT,
       selected_account_ids TEXT,
@@ -61,6 +67,21 @@ const initLinksSchema = () => {
       FOREIGN KEY (operation_id) REFERENCES links_operations(id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS links_result_files (
+      file_id           TEXT PRIMARY KEY,
+      operation_id      INTEGER,
+      user_id           TEXT NOT NULL,
+      username          TEXT,
+      search_query      TEXT,
+      file_name         TEXT NOT NULL,
+      file_path         TEXT NOT NULL,
+      links_count       INTEGER NOT NULL DEFAULT 0,
+      file_size         INTEGER NOT NULL DEFAULT 0,
+      status            TEXT NOT NULL DEFAULT 'available' CHECK (status IN ('available','missing','deleted')),
+      created_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (operation_id) REFERENCES links_operations(id) ON DELETE SET NULL
+    );
+
     CREATE TABLE IF NOT EXISTS links_settings (
       id                 INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id            TEXT    NOT NULL UNIQUE,
@@ -71,6 +92,10 @@ const initLinksSchema = () => {
       output_dir         TEXT    DEFAULT './data/links_output',
       updated_at         DATETIME DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE INDEX IF NOT EXISTS idx_links_result_files_created ON links_result_files(created_at);
+    CREATE INDEX IF NOT EXISTS idx_links_result_files_user ON links_result_files(user_id);
+    CREATE INDEX IF NOT EXISTS idx_links_result_files_operation ON links_result_files(operation_id);
 
     CREATE INDEX IF NOT EXISTS idx_links_ops_user_id
       ON links_operations(user_id);
@@ -87,6 +112,7 @@ const initLinksSchema = () => {
     CREATE INDEX IF NOT EXISTS idx_links_found_user_hash
       ON links_found(user_id, url_hash);
   `);
+  ensureColumn(db, 'links_operations', 'search_query', 'TEXT');
 
   logger.info('Links database schema initialized');
 };
@@ -130,14 +156,15 @@ const linksOperationQueries = {
     const name = _buildOperationName(wizard);
     const stmt = getDb().prepare(`
       INSERT INTO links_operations
-        (user_id, name, status,
+        (user_id, name, search_query, status,
          account_mode, selected_account_ids,
          link_type, period, custom_start, custom_end, search_depth)
-      VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)
     `);
     const result = stmt.run(
       String(userId),
       name,
+      wizard.searchQuery || name,
       wizard.accountMode || 'all',
       JSON.stringify(wizard.selectedAccountIds || []),
       wizard.linkType    || 'both',
@@ -437,6 +464,29 @@ const linksSettingsQueries = {
   },
 };
 
+// ─── Result files ───────────────────────────────────────────────────────────────
+
+const linksResultFilesQueries = {
+  create: (record) => {
+    const db = getDb();
+    const result = db.prepare(`INSERT INTO links_result_files (file_id, operation_id, user_id, username, search_query, file_name, file_path, links_count, file_size, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'available')`).run(
+      record.fileId, record.operationId, String(record.userId), record.username || null, record.searchQuery || null,
+      record.fileName, record.filePath, Number(record.linksCount) || 0, Number(record.fileSize) || 0,
+    );
+    return linksResultFilesQueries.getById(record.fileId) || result;
+  },
+  getById: (fileId) => getDb().prepare(`SELECT rf.*, lo.name AS operation_name, lo.link_type, lo.period, lo.search_depth FROM links_result_files rf LEFT JOIN links_operations lo ON lo.id=rf.operation_id WHERE rf.file_id=?`).get(String(fileId)) || null,
+  list: ({ search, limit = 20, offset = 0 } = {}) => {
+    const params = []; const where = [];
+    if (search) { where.push('(rf.file_name LIKE ? OR rf.username LIKE ? OR rf.user_id LIKE ? OR rf.search_query LIKE ? OR rf.file_id LIKE ?)'); const term = `%${search}%`; params.push(term, term, term, term, term); }
+    params.push(Math.min(Number(limit) || 20, 100), Math.max(Number(offset) || 0, 0));
+    return getDb().prepare(`SELECT rf.*, lo.name AS operation_name, lo.link_type, lo.period, lo.search_depth FROM links_result_files rf LEFT JOIN links_operations lo ON lo.id=rf.operation_id ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY rf.created_at DESC LIMIT ? OFFSET ?`).all(...params);
+  },
+  markMissing: (fileId) => getDb().prepare("UPDATE links_result_files SET status='missing' WHERE file_id=?").run(String(fileId)),
+  markDeleted: (fileId) => getDb().prepare("UPDATE links_result_files SET status='deleted' WHERE file_id=?").run(String(fileId)),
+  delete: (fileId) => getDb().prepare('DELETE FROM links_result_files WHERE file_id=?').run(String(fileId)),
+};
+
 // ─── Exports ──────────────────────────────────────────────────────────────────
 
 module.exports = {
@@ -445,4 +495,5 @@ module.exports = {
   linksFoundQueries,
   linksStatsQueries,
   linksSettingsQueries,
+  linksResultFilesQueries,
 };
