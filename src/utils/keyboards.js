@@ -9,6 +9,8 @@ const mainMenuKeyboard = () =>
   Markup.inlineKeyboard([
     [Markup.button.callback('🚀 محرك النشر', 'publish_menu')],
     [Markup.button.callback('📂 الحسابات', 'accounts_menu')],
+    [Markup.button.callback('🎟️ استخدام كود', 'use_code')],
+    [Markup.button.callback('🛠️ لوحة إدارة الأكواد', 'codes_menu')],
     [Markup.button.callback('🔗 الروابط', 'links_menu')],
     [Markup.button.callback('🔗 الانضمام للروابط', 'join_menu')],
     [Markup.button.callback('📁 قاعدة البيانات والمجلدات', 'folders_menu')],

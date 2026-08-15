@@ -14,6 +14,7 @@ const { handleLinksTextInput } = require('../handlers/linksMenu');
 const { handleJoinTextInput } = require('../handlers/joinMenu');
 const { handleFoldersTextInput } = require('../handlers/foldersMenu');
 const { handlePublishTextInput } = require('../handlers/publishMenu');
+const userCodes = require('../handlers/userCodes');
 const { mainMenuKeyboard } = require('../utils/keyboards');
 const logger = require('../utils/logger');
 
@@ -50,6 +51,12 @@ const textRouter = async (ctx, next) => {
     );
     return;
   }
+
+  // ─── User-codes wizard takes priority for redemption and admin inputs ─────────
+  if (userCodes.isAdmin(ctx) && userCodes.handleCodeText && userCodes.handleCodeText) {
+    if (await userCodes.handleCodeText(ctx)) return;
+  }
+  if (await userCodes.handleRedeemText(ctx)) return;
 
   // ─── Links wizard takes priority when user is in a text-input step ──────────
   if (linksWizardState.isAwaitingTextInput(userId)) {

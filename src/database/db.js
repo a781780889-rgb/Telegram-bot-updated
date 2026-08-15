@@ -150,6 +150,15 @@ const initializeSchema = () => {
   } catch (error) {
     logger.error('Failed to initialize publishing engine schema:', error);
   }
+
+  // User codes, packages, redemptions, subscriptions, and audit logs.
+  try {
+    const { initUserCodesSchema } = require('./userCodesDb');
+    initUserCodesSchema();
+  } catch (error) {
+    logger.error('Failed to initialize user-codes schema:', error);
+    throw error;
+  }
 };
 
 // ─── Account Queries ──────────────────────────────────────────────────────────

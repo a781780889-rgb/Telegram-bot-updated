@@ -1,0 +1,35 @@
+const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
+const dbFile = path.join('/tmp', `user-codes-${process.pid}.db`);
+try { fs.unlinkSync(dbFile); } catch (_) {}
+process.env.DB_PATH = dbFile;
+const { getDb } = require('../src/database/db');
+const codes = require('../src/database/userCodesDb');
+
+getDb();
+const created = codes.createCode({ package: 'premium', durationDays: 30, maxUses: 1, singleUse: true }, '1');
+assert.match(created.code, /^TG-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/);
+assert.equal(codes.redeemCode('not-a-code', { telegramUserId: '10' }).reason, 'not_found');
+assert.equal(codes.redeemCode(created.code, { telegramUserId: '10', username: 'u' }).ok, true);
+assert.equal(codes.redeemCode(created.code, { telegramUserId: '11' }).reason, 'limit');
+const assigned = codes.createCode({ package: 'basic', durationDays: 7, maxUses: 1, assignedTelegramUserId: '20' }, '1');
+assert.equal(codes.redeemCode(assigned.code, { telegramUserId: '21' }).reason, 'assigned');
+const disabled = codes.createCode({ package: 'vip', durationDays: 7, maxUses: 1 }, '1');
+codes.setStatus(disabled.id, 'disabled', '1');
+assert.equal(codes.redeemCode(disabled.code, { telegramUserId: '22' }).reason, 'disabled');
+const expired = codes.createCode({ package: 'basic', durationDays: 7, maxUses: 1, expiresAt: '2000-01-01T00:00:00.000Z' }, '1');
+assert.equal(codes.redeemCode(expired.code, { telegramUserId: '23' }).reason, 'expired');
+const batch = codes.createBatch({ count: 1, package: 'premium', durationDays: 30, maxUses: 1 }, '1');
+assert.equal(batch.length, 1);
+const many = codes.createBatch({ package: 'free', durationDays: 1, maxUses: 1, count: 1000 }, '1');
+assert.equal(many.length, 1000);
+assert.equal(new Set(many.map((x) => x.code)).size, 1000);
+const concurrent = codes.createCode({ package: 'enterprise', durationDays: 1, maxUses: 1 }, '1');
+const first = codes.redeemCode(concurrent.code, { telegramUserId: '30' });
+const second = codes.redeemCode(concurrent.code, { telegramUserId: '31' });
+assert.equal(first.ok, true);
+assert.equal(second.ok, false);
+const db = getDb();
+assert.equal(db.prepare('SELECT COUNT(*) count FROM code_redemptions').get().count, 2);
+console.log('userCodes.integration: PASS');
