@@ -89,8 +89,10 @@ const resolvePeriod = (period, customStart, customEnd) => {
 
 // ─── Search Depth → Message Limit ────────────────────────────────────────────
 
+const DEEP_MESSAGE_LIMIT = Math.max(1000, Number(process.env.LINKS_DEEP_MESSAGE_LIMIT || 5000));
+const SEARCH_REQUEST_TIMEOUT_MS = Math.max(15000, Number(process.env.LINKS_REQUEST_TIMEOUT_MS || 90000));
 const depthToLimit = (depth) => {
-  const map = { fast: 100, medium: 500, deep: 0 }; // 0 = unlimited
+  const map = { fast: 100, medium: 500, deep: DEEP_MESSAGE_LIMIT };
   return map[depth] ?? 500;
 };
 
@@ -180,6 +182,10 @@ const runSearch = async (userId, operationId, wizard, onProgress) => {
     const settings = linksSettingsQueries.get(userId);
     const { fromDate, toDate } = resolvePeriod(wizard.period, wizard.customStart, wizard.customEnd);
     const msgLimit = depthToLimit(wizard.searchDepth);
+    progress.lastAction = wizard.searchDepth === 'deep'
+      ? `🔬 الفحص العميق مفعل — حتى ${msgLimit} رسالة لكل محادثة`
+      : `جارٍ بدء الفحص (${wizard.searchDepth})`;
+    await onProgress({ ...progress });
 
     // Resolve accounts to search
     let accounts = [];
@@ -219,13 +225,14 @@ const runSearch = async (userId, operationId, wizard, onProgress) => {
 
       let client = null;
       try {
-        const { loadSession } = require('./telegramClient');
-        if (!account.session_file) {
+        const { loadSession, restoreSessionFile } = require('./telegramClient');
+        const sessionFile = restoreSessionFile(account) || account.session_file;
+        if (!sessionFile) {
           progress.lastAction = `⚠️ لا توجد جلسة محفوظة لـ ${progress.currentAccount}`;
           await onProgress({ ...progress });
           continue;
         }
-        client = await loadSession(account.session_file);
+        client = await withTimeout(loadSession(sessionFile), SEARCH_REQUEST_TIMEOUT_MS, 'انتهت مهلة تحميل الجلسة');
       } catch (sessionErr) {
         logger.warn(`Cannot load session for account ${account.id}:`, sessionErr.message);
         progress.lastAction = `⚠️ فشل تحميل جلسة ${progress.currentAccount}`;
@@ -235,7 +242,7 @@ const runSearch = async (userId, operationId, wizard, onProgress) => {
 
       try {
         // Get all dialogs
-        const dialogs = await client.getDialogs({ limit: 500 });
+        const dialogs = await withTimeout(client.getDialogs({ limit: 500 }), SEARCH_REQUEST_TIMEOUT_MS, 'انتهت مهلة تحميل المحادثات');
         const totalDialogs = dialogs.length;
 
         for (let di = 0; di < dialogs.length; di++) {
@@ -263,7 +270,7 @@ const runSearch = async (userId, operationId, wizard, onProgress) => {
 
           try {
             const iterParams = { limit: msgLimit || undefined };
-            const messages = await client.getMessages(dialog.entity, iterParams);
+            const messages = await withTimeout(client.getMessages(dialog.entity, iterParams), SEARCH_REQUEST_TIMEOUT_MS, 'انتهت مهلة قراءة المحادثة');
 
             const chatSeenHashes = new Set();
 
@@ -275,6 +282,20 @@ const runSearch = async (userId, operationId, wizard, onProgress) => {
 
               const text = msg.message || '';
               progress.scannedMessages++;
+
+              if (progress.scannedMessages % 100 === 0) {
+                _updateElapsed(progress, startTime);
+                await onProgress({ ...progress });
+                linksOperationQueries.updateProgress(operationId, {
+                  status: 'running',
+                  chats_scanned: progress.scannedChats,
+                  messages_scanned: progress.scannedMessages,
+                  telegram_links: progress.telegramLinks,
+                  whatsapp_links: progress.whatsappLinks,
+                  total_links: progress.totalLinks,
+                  saved_links: progress.savedLinks,
+                });
+              }
 
               const links = extractLinks(text, wizard.linkType);
 
@@ -435,6 +456,10 @@ const runSearch = async (userId, operationId, wizard, onProgress) => {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const _sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+const withTimeout = (promise, timeoutMs, message) => Promise.race([
+  promise,
+  new Promise((_, reject) => setTimeout(() => reject(new Error(message)), timeoutMs)),
+]);
 
 const _updateElapsed = (progress, startTime) => {
   progress.elapsedSeconds = Math.round((Date.now() - startTime) / 1000);
@@ -493,4 +518,5 @@ module.exports = {
   extractLinks,
   hashUrl,
   resolvePeriod,
+  depthToLimit,
 };
