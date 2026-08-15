@@ -1,7 +1,11 @@
 const { Markup } = require('telegraf');
 const db = require('../database/userCodesDb');
+const { botUserQueries } = require('../database/db');
 const wizard = require('../services/userCodesWizardState');
 const logger = require('../utils/logger');
+const { mainMenuKeyboard } = require('../utils/keyboards');
+const { welcomeMessage } = require('../utils/messages');
+const { activationKeyboard, activationMessage } = require('../middlewares/activationGuard');
 
 const adminIds = () => new Set(String(process.env.ADMIN_TELEGRAM_IDS || '').split(',').map((v) => v.trim()).filter(Boolean));
 const isAdmin = (ctx) => adminIds().has(String(ctx.from?.id));
@@ -18,6 +22,8 @@ const adminMenuKeyboard = () => Markup.inlineKeyboard([
   [Markup.button.callback('🔎 بحث عن كود', 'codes_search')],
   [Markup.button.callback('📊 الإحصائيات', 'codes_stats')],
   [Markup.button.callback('📤 تصدير الأكواد', 'codes_export')],
+  [Markup.button.callback('👥 المستخدمون المفعلون', 'activated_users')],
+  [Markup.button.callback('🚫 المستخدمون غير المفعلين', 'inactive_users')],
   [Markup.button.callback('🏠 الرئيسية', 'main_menu')],
 ]);
 const codeActions = (id, status) => Markup.inlineKeyboard([
@@ -32,9 +38,9 @@ const handleRedeemText = async (ctx) => {
   const value = wizard.get(ctx.from.id); if (!value || value.state !== 'redeem') return false;
   wizard.reset(ctx.from.id);
   const result = db.redeemCode(ctx.message.text, { telegramUserId: ctx.from.id, username: ctx.from.username, firstName: ctx.from.first_name });
-  const messages = { invalid: '❌ صيغة الكود غير صحيحة.', not_found: '❌ الكود غير موجود.', disabled: '❌ هذا الكود معطل.', expired: '❌ انتهت صلاحية هذا الكود.', limit: '❌ تم استنفاد عدد مرات استخدام هذا الكود.', assigned: '❌ هذا الكود مرتبط بمستخدم آخر.', duplicate: '❌ لقد استخدمت هذا الكود مسبقاً.' };
-  if (!result.ok) { await ctx.reply(messages[result.reason] || '❌ تعذر استخدام الكود حالياً.', backMain()); return true; }
-  await ctx.reply(`✅ تم تفعيل الكود بنجاح\n\n🎟️ الكود: ${result.code.code}\n📦 الباقة: ${result.code.package_name}\n⏳ المدة: ${result.code.duration_days} يوم\n📅 ينتهي في: ${result.end.toLocaleDateString('ar-EG')}`, backMain());
+  const messages = { invalid: '❌ كود التفعيل غير صحيح.\n\nيرجى التأكد من الكود وإعادة المحاولة.', not_found: '❌ كود التفعيل غير صحيح.\n\nيرجى التأكد من الكود وإعادة المحاولة.', disabled: '🚫 هذا الكود غير فعال حالياً.', expired: '⏰ كود التفعيل منتهي الصلاحية.', limit: '⚠️ هذا الكود تم استخدامه مسبقاً.', assigned: '❌ هذا الكود مرتبط بمستخدم آخر.', duplicate: '⚠️ هذا الكود تم استخدامه مسبقاً.' };
+  if (!result.ok) { await ctx.reply(messages[result.reason] || '❌ تعذر استخدام الكود حالياً.', { parse_mode: 'Markdown', ...activationKeyboard() }); return true; }
+  await ctx.reply(`✅ تم تفعيل حسابك بنجاح.\n\nيمكنك الآن استخدام البوت.\n\n🎟️ الكود: ${result.code.code}\n📦 الباقة: ${result.code.package_name}\n⏳ المدة: ${result.code.duration_days} يوم\n📅 ينتهي في: ${result.end.toLocaleDateString('ar-EG')}`, { parse_mode: 'Markdown', ...mainMenuKeyboard(ctx.from.id) });
   return true;
 };
 
@@ -55,8 +61,18 @@ const handleCodeText = async (ctx) => {
 const handleCodesList = async (ctx) => { if (!isAdmin(ctx)) return; await ctx.answerCbQuery(); const rows = db.listCodes({ limit: 15 }); await editOrReply(ctx, rows.length ? `📋 الأكواد (${rows.length} نتيجة)\n\n${rows.map(formatCode).join('\n\n')}` : 'لا توجد أكواد منشأة بعد.', { parse_mode: 'Markdown', ...adminMenuKeyboard() }); };
 const handleCodesSearch = async (ctx) => { if (!isAdmin(ctx)) return; wizard.set(ctx.from.id, 'search'); await ctx.answerCbQuery(); await ctx.reply('أرسل جزءاً من الكود أو اسم الكود أو Telegram User ID للبحث.'); };
 const handleCodesStats = async (ctx) => { if (!isAdmin(ctx)) return; await ctx.answerCbQuery(); const s = db.stats(); const counts = Object.fromEntries(s.counts.map((x) => [x.status, x.count])); await editOrReply(ctx, `📊 *إحصائيات الأكواد*\n\nالإجمالي: ${Object.values(counts).reduce((a,b) => a + Number(b), 0)}\n✅ فعالة: ${counts.active || 0}\n♻️ مستخدمة: ${counts.used || 0}\n⏳ منتهية: ${counts.expired || 0}\n⛔ معطلة: ${counts.disabled || 0}\n🔁 إجمالي الاستردادات: ${s.totalRedemptions}\n\nالأكثر استخداماً:\n${s.topPackages.map((p) => `• ${p.name}: ${p.count}`).join('\n') || 'لا توجد بيانات'}`, { parse_mode: 'Markdown', ...adminMenuKeyboard() }); };
+const formatActivationUser = (user) => `🆔 ${user.telegram_user_id}${user.username ? ` @${user.username}` : ''}\n👤 ${user.first_name || 'بدون اسم'}\n📌 ${user.is_activated ? 'مفعل' : 'غير مفعل'}${user.activation_expires_at ? `\n⏳ ينتهي: ${user.activation_expires_at}` : ''}`;
+const handleUsersList = async (ctx, activated) => {
+  if (!isAdmin(ctx)) return;
+  await ctx.answerCbQuery();
+  const rows = botUserQueries.listActivationUsers(activated);
+  const text = `${activated ? '👥 المستخدمون المفعلون' : '🚫 المستخدمون غير المفعلين'}\n\n${rows.length ? rows.map(formatActivationUser).join('\n\n') : 'لا توجد بيانات.'}`;
+  const buttons = rows.slice(0, 50).map((user) => [Markup.button.callback(activated ? `🚫 تعطيل ${user.telegram_user_id}` : `✅ تفعيل ${user.telegram_user_id}`, `${activated ? 'deactivate_user' : 'activate_user'}_${user.telegram_user_id}`)]);
+  await editOrReply(ctx, text, { ...Markup.inlineKeyboard([...buttons, [Markup.button.callback('⬅️ إدارة الأكواد', 'codes_menu')]]) });
+};
+const handleUserActivationToggle = async (ctx, activated) => { if (!isAdmin(ctx)) return; const userId = ctx.match[1]; const result = botUserQueries.setActivated(userId, activated); await ctx.answerCbQuery(result.changes ? 'تم تحديث الحالة.' : 'المستخدم غير موجود.'); await handleUsersList(ctx, activated); };
 const handleCodesExport = async (ctx) => { if (!isAdmin(ctx)) return; await ctx.answerCbQuery(); const rows = db.listCodes({ limit: 10000 }); const body = ['id,code,package,status,uses,max_uses,created_at,expires_at', ...rows.map((r) => [r.id, r.code, r.package_slug, r.status, r.uses_count, r.max_uses, r.created_at, r.expires_at || ''].join(','))].join('\n'); await ctx.replyWithDocument({ source: Buffer.from(body, 'utf8'), filename: `user-codes-${Date.now()}.csv` }, adminMenuKeyboard()); };
 const statusAction = (status) => async (ctx) => { if (!isAdmin(ctx)) return; const id = Number(ctx.match[1]); db.setStatus(id, status, ctx.from.id); await ctx.answerCbQuery('تم الحفظ.'); const code = db.getCode(id); await editOrReply(ctx, code ? formatCode(code) : 'الكود غير موجود.', { parse_mode: 'Markdown', ...codeActions(id, code?.status) }); };
 const handleCodeDelete = async (ctx) => { if (!isAdmin(ctx)) return; const result = db.deleteCode(Number(ctx.match[1]), ctx.from.id); await ctx.answerCbQuery(result.changes ? 'تم الحذف.' : 'لا يمكن حذف كود مستخدم.'); await handleCodesList(ctx); };
 
-module.exports = { isAdmin, handleUseCodeStart, handleRedeemText, handleCodesMenu, handleCreateStart, handleBatchStart, handleCodeText, handleCodesList, handleCodesSearch, handleCodesStats, handleCodesExport, handleCodeDisable: statusAction('disabled'), handleCodeEnable: statusAction('active'), handleCodeDelete };
+module.exports = { isAdmin, handleUseCodeStart, handleRedeemText, handleCodesMenu, handleCreateStart, handleBatchStart, handleCodeText, handleCodesList, handleCodesSearch, handleCodesStats, handleCodesExport, handleUsersList, handleUserActivationToggle, handleCodeDisable: statusAction('disabled'), handleCodeEnable: statusAction('active'), handleCodeDelete };

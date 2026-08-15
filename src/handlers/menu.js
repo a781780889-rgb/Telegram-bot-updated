@@ -4,6 +4,7 @@ const { mainMenuKeyboard, backToMenuKeyboard } = require('../utils/keyboards');
 const { welcomeMessage, helpMessage } = require('../utils/messages');
 const logger = require('../utils/logger');
 const { Markup } = require('telegraf');
+const { activationKeyboard, activationMessage } = require('../middlewares/activationGuard');
 
 const handleStart = async (ctx) => {
   logger.info(`handleStart triggered for user ${ctx.from.id}`);
@@ -11,6 +12,12 @@ const handleStart = async (ctx) => {
     const { id, username, first_name } = ctx.from;
     botUserQueries.upsert(id, username, first_name);
     sessionState.resetState(String(id));
+    const activation = botUserQueries.getActivationStatus(id);
+    const admins = new Set(String(process.env.ADMIN_TELEGRAM_IDS || '').split(',').map((value) => value.trim()).filter(Boolean));
+    if (!activation.activated && !admins.has(String(id))) {
+      await ctx.reply(activationMessage(activation.reason), { parse_mode: 'Markdown', ...activationKeyboard() });
+      return;
+    }
     await ctx.reply(welcomeMessage(first_name), {
       parse_mode: 'Markdown',
       ...mainMenuKeyboard(id),

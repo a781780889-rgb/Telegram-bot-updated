@@ -143,6 +143,7 @@ const {
 } = require('./handlers/publishMenu');
 const { startPublishScheduler } = require('./services/publishService');
 const userCodes = require('./handlers/userCodes');
+const { activationGuard } = require('./middlewares/activationGuard');
 
 const { restoreAllAccounts } = require('./services/sessionRestoreService');
 
@@ -174,6 +175,9 @@ bot.use(async (ctx, next) => {
   return await next();
 });
 
+// Mandatory activation guard: regular users cannot reach any route before activation.
+bot.use(activationGuard);
+
 // ─── Global Error Handler ─────────────────────────────────────────────────────
 
 bot.catch(errorHandler);
@@ -201,6 +205,10 @@ bot.action('codes_list', userCodes.handleCodesList);
 bot.action('codes_search', userCodes.handleCodesSearch);
 bot.action('codes_stats', userCodes.handleCodesStats);
 bot.action('codes_export', userCodes.handleCodesExport);
+bot.action('activated_users', async (ctx) => userCodes.handleUsersList(ctx, true));
+bot.action('inactive_users', async (ctx) => userCodes.handleUsersList(ctx, false));
+bot.action(/^activate_user_(\d+)$/, async (ctx) => userCodes.handleUserActivationToggle(ctx, true));
+bot.action(/^deactivate_user_(\d+)$/, async (ctx) => userCodes.handleUserActivationToggle(ctx, false));
 bot.action(/^code_disable_(\d+)$/, userCodes.handleCodeDisable);
 bot.action(/^code_enable_(\d+)$/, userCodes.handleCodeEnable);
 bot.action(/^code_delete_(\d+)$/, userCodes.handleCodeDelete);

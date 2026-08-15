@@ -12,6 +12,9 @@ const created = codes.createCode({ package: 'premium', durationDays: 30, maxUses
 assert.match(created.code, /^TG-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/);
 assert.equal(codes.redeemCode('not-a-code', { telegramUserId: '10' }).reason, 'not_found');
 assert.equal(codes.redeemCode(created.code, { telegramUserId: '10', username: 'u' }).ok, true);
+const { botUserQueries } = require('../src/database/db');
+assert.equal(botUserQueries.getActivationStatus('10').activated, true);
+assert.equal(Boolean(botUserQueries.getActivationStatus('10').row.activation_expires_at), true);
 assert.equal(codes.redeemCode(created.code, { telegramUserId: '11' }).reason, 'limit');
 const assigned = codes.createCode({ package: 'basic', durationDays: 7, maxUses: 1, assignedTelegramUserId: '20' }, '1');
 assert.equal(codes.redeemCode(assigned.code, { telegramUserId: '21' }).reason, 'assigned');

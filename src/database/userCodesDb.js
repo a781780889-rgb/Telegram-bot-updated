@@ -169,6 +169,10 @@ const redeemCode = (rawCode, user, actorId = user.telegramUserId) => {
       VALUES (?, ?, ?, ?, ?, ?, ?)`).run(row.id, String(user.telegramUserId), user.username || null, user.firstName || null, row.package_id, start.toISOString(), end.toISOString());
     db.prepare(`INSERT INTO user_subscriptions (telegram_user_id, package_id, source_code_id, start_at, end_at)
       VALUES (?, ?, ?, ?, ?)`).run(String(user.telegramUserId), row.package_id, row.id, start.toISOString(), end.toISOString());
+    // Activation is committed in the same SQLite transaction as redemption.
+    const { botUserQueries } = require('./db');
+    botUserQueries.upsert(user.telegramUserId, user.username, user.firstName);
+    botUserQueries.activate(user.telegramUserId, row.id, end.toISOString());
     const nextUses = row.uses_count + 1;
     db.prepare(`UPDATE user_codes SET uses_count=?, status=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='active' AND uses_count < max_uses`)
       .run(nextUses, nextUses >= row.max_uses ? 'used' : 'active', row.id);

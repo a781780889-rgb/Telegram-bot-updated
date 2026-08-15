@@ -121,6 +121,23 @@ const runMigrations = (database) => {
       db.exec('ALTER TABLE accounts ADD COLUMN last_restored_at DATETIME');
     }
   });
+
+  // ── v3: Mandatory account activation fields ─────────────────────────────────
+  apply(3, 'add_bot_user_activation', (db) => {
+    const additions = [
+      ['is_activated', "INTEGER NOT NULL DEFAULT 0 CHECK (is_activated IN (0,1))"],
+      ['activated_at', 'DATETIME'],
+      ['activation_code_id', 'INTEGER'],
+      ['activation_expires_at', 'DATETIME'],
+      ['deactivated_at', 'DATETIME'],
+    ];
+    for (const [column, definition] of additions) {
+      if (!columnExists(db, 'bot_users', column)) {
+        db.exec(`ALTER TABLE bot_users ADD COLUMN ${column} ${definition}`);
+      }
+    }
+    db.exec('CREATE INDEX IF NOT EXISTS idx_bot_users_activation ON bot_users(is_activated, activation_expires_at)');
+  });
 };
 
 // ─── Schema initializer (called once on first getDb()) ────────────────────────
@@ -294,6 +311,40 @@ const botUserQueries = {
     `);
     return stmt.run(String(telegramUserId), username || null, firstName || null);
   },
+
+  getActivationStatus: (telegramUserId) => {
+    const row = getDb().prepare(`
+      SELECT is_activated, activated_at, activation_code_id, activation_expires_at, deactivated_at
+      FROM bot_users WHERE telegram_user_id = ?
+    `).get(String(telegramUserId));
+    if (!row || row.is_activated !== 1) return { activated: false, reason: 'not_activated', row };
+    if (row.activation_expires_at && new Date(row.activation_expires_at).getTime() <= Date.now()) {
+      getDb().prepare(`UPDATE bot_users SET is_activated=0, deactivated_at=CURRENT_TIMESTAMP WHERE telegram_user_id=?`).run(String(telegramUserId));
+      return { activated: false, reason: 'expired', row: { ...row, is_activated: 0 } };
+    }
+    return { activated: true, reason: 'active', row };
+  },
+
+  activate: (telegramUserId, codeId, expiresAt) => getDb().prepare(`
+    INSERT INTO bot_users (telegram_user_id, is_activated, activated_at, activation_code_id, activation_expires_at, last_seen)
+    VALUES (?, 1, CURRENT_TIMESTAMP, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(telegram_user_id) DO UPDATE SET
+      is_activated=1, activated_at=CURRENT_TIMESTAMP, activation_code_id=excluded.activation_code_id,
+      activation_expires_at=excluded.activation_expires_at, deactivated_at=NULL, last_seen=CURRENT_TIMESTAMP
+  `).run(String(telegramUserId), codeId, expiresAt),
+
+  deactivate: (telegramUserId) => getDb().prepare(`
+    UPDATE bot_users SET is_activated=0, deactivated_at=CURRENT_TIMESTAMP WHERE telegram_user_id=?
+  `).run(String(telegramUserId)),
+
+  listActivationUsers: (activated) => getDb().prepare(`
+    SELECT telegram_user_id, username, first_name, is_activated, activated_at, activation_expires_at, last_seen
+    FROM bot_users WHERE is_activated = ? ORDER BY last_seen DESC LIMIT 100
+  `).all(activated ? 1 : 0),
+
+  setActivated: (telegramUserId, activated) => getDb().prepare(`
+    UPDATE bot_users SET is_activated=?, deactivated_at=? WHERE telegram_user_id=?
+  `).run(activated ? 1 : 0, activated ? null : new Date().toISOString(), String(telegramUserId)),
 };
 
 // ─── Restore-specific Queries ─────────────────────────────────────────────────
