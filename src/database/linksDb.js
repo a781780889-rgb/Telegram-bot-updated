@@ -67,6 +67,46 @@ const initLinksSchema = () => {
       FOREIGN KEY (operation_id) REFERENCES links_operations(id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS links_search_checkpoints (
+      operation_id       INTEGER NOT NULL,
+      account_id         INTEGER NOT NULL,
+      dialog_id          TEXT    NOT NULL,
+      current_cursor     TEXT,
+      last_message_id    TEXT,
+      oldest_message_at  DATETIME,
+      messages_processed INTEGER NOT NULL DEFAULT 0,
+      pages_processed    INTEGER NOT NULL DEFAULT 0,
+      links_found        INTEGER NOT NULL DEFAULT 0,
+      links_saved        INTEGER NOT NULL DEFAULT 0,
+      status              TEXT    NOT NULL DEFAULT 'running',
+      last_error          TEXT,
+      updated_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (operation_id, account_id, dialog_id),
+      FOREIGN KEY (operation_id) REFERENCES links_operations(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS links_idempotency (
+      identity_key TEXT PRIMARY KEY,
+      user_id      TEXT NOT NULL,
+      operation_id INTEGER NOT NULL,
+      url_hash     TEXT NOT NULL,
+      created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (operation_id) REFERENCES links_operations(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS links_search_errors (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      operation_id INTEGER NOT NULL,
+      account_id   INTEGER,
+      dialog_id    TEXT,
+      cursor       TEXT,
+      category     TEXT NOT NULL,
+      message      TEXT NOT NULL,
+      retry_count  INTEGER NOT NULL DEFAULT 0,
+      created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (operation_id) REFERENCES links_operations(id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS links_result_files (
       file_id           TEXT PRIMARY KEY,
       operation_id      INTEGER,
@@ -93,6 +133,10 @@ const initLinksSchema = () => {
       updated_at         DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE INDEX IF NOT EXISTS idx_links_checkpoint_status ON links_search_checkpoints(operation_id, status);
+    CREATE INDEX IF NOT EXISTS idx_links_search_errors_operation ON links_search_errors(operation_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_links_idempotency_user_hash ON links_idempotency(user_id, url_hash);
+
     CREATE INDEX IF NOT EXISTS idx_links_result_files_created ON links_result_files(created_at);
     CREATE INDEX IF NOT EXISTS idx_links_result_files_user ON links_result_files(user_id);
     CREATE INDEX IF NOT EXISTS idx_links_result_files_operation ON links_result_files(operation_id);
@@ -112,7 +156,23 @@ const initLinksSchema = () => {
     CREATE INDEX IF NOT EXISTS idx_links_found_user_hash
       ON links_found(user_id, url_hash);
   `);
+  db.exec(`
+    INSERT OR IGNORE INTO links_idempotency (identity_key, user_id, operation_id, url_hash)
+    SELECT user_id || ':' || url_hash, user_id, MIN(operation_id), url_hash
+    FROM links_found
+    GROUP BY user_id, url_hash
+  `);
   ensureColumn(db, 'links_operations', 'search_query', 'TEXT');
+  const operationColumns = [
+    ['completion_reason', 'TEXT'], ['resume_count', 'INTEGER NOT NULL DEFAULT 0'],
+    ['last_error', 'TEXT'], ['last_resume_at', 'DATETIME'], ['current_cursor', 'TEXT'],
+    ['last_message_id', 'TEXT'], ['pages_completed', 'INTEGER NOT NULL DEFAULT 0'],
+    ['pages_failed', 'INTEGER NOT NULL DEFAULT 0'], ['retry_count', 'INTEGER NOT NULL DEFAULT 0'],
+    ['flood_wait_count', 'INTEGER NOT NULL DEFAULT 0'], ['links_extracted', 'INTEGER NOT NULL DEFAULT 0'],
+    ['links_validated', 'INTEGER NOT NULL DEFAULT 0'], ['links_saved', 'INTEGER NOT NULL DEFAULT 0'],
+    ['duplicates_skipped', 'INTEGER NOT NULL DEFAULT 0'],
+  ];
+  for (const [column, definition] of operationColumns) ensureColumn(db, 'links_operations', column, definition);
 
   logger.info('Links database schema initialized');
 };
@@ -221,7 +281,10 @@ const linksOperationQueries = {
       'status', 'accounts_used', 'chats_scanned', 'messages_scanned',
       'telegram_links', 'whatsapp_links', 'total_links',
       'duplicates_removed', 'saved_links', 'file_size_bytes',
-      'output_dir', 'error_message',
+      'output_dir', 'error_message', 'completion_reason', 'resume_count',
+      'last_error', 'last_resume_at', 'current_cursor', 'last_message_id',
+      'pages_completed', 'pages_failed', 'retry_count', 'flood_wait_count',
+      'links_extracted', 'links_validated', 'links_saved', 'duplicates_skipped',
     ];
     const fields = [];
     const values = [];
@@ -243,14 +306,20 @@ const linksOperationQueries = {
    * @param {number} operationId
    * @param {string} status  – 'completed' | 'stopped' | 'error'
    */
-  finish: (operationId, status) => {
+  listResumable: () => getDb().prepare(`
+    SELECT * FROM links_operations
+    WHERE status IN ('pending', 'starting', 'running', 'paused_rate_limit', 'resuming', 'stalled')
+    ORDER BY id ASC
+  `).all(),
+
+  finish: (operationId, status, completionReason = null) => {
     getDb()
       .prepare(`
         UPDATE links_operations
-        SET status = ?, finished_at = CURRENT_TIMESTAMP
+        SET status = ?, completion_reason = COALESCE(?, completion_reason), finished_at = CURRENT_TIMESTAMP
         WHERE id = ?
       `)
-      .run(status, operationId);
+      .run(status, completionReason, operationId);
   },
 
   /**
@@ -305,10 +374,85 @@ const linksOperationQueries = {
 
 // ─── linksFoundQueries ────────────────────────────────────────────────────────
 
+const linksCheckpointQueries = {
+  get: (operationId, accountId, dialogId) => getDb().prepare(`
+    SELECT * FROM links_search_checkpoints
+    WHERE operation_id=? AND account_id=? AND dialog_id=?
+  `).get(operationId, accountId, String(dialogId)) || null,
+  save: (operationId, accountId, dialogId, checkpoint) => {
+    const fields = {
+      cursor: checkpoint.currentCursor ?? null,
+      lastMessageId: checkpoint.lastMessageId ?? null,
+      oldestMessageAt: checkpoint.oldestMessageTimestamp ?? null,
+      messagesProcessed: Number(checkpoint.messagesProcessed) || 0,
+      pagesProcessed: Number(checkpoint.pagesProcessed) || 0,
+      linksFound: Number(checkpoint.linksFound) || 0,
+      linksSaved: Number(checkpoint.linksSaved) || 0,
+      status: checkpoint.status || 'running',
+      lastError: checkpoint.lastError || null,
+    };
+    return getDb().prepare(`
+      INSERT INTO links_search_checkpoints
+        (operation_id, account_id, dialog_id, current_cursor, last_message_id,
+         oldest_message_at, messages_processed, pages_processed, links_found,
+         links_saved, status, last_error, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(operation_id, account_id, dialog_id) DO UPDATE SET
+        current_cursor=excluded.current_cursor, last_message_id=excluded.last_message_id,
+        oldest_message_at=excluded.oldest_message_at, messages_processed=excluded.messages_processed,
+        pages_processed=excluded.pages_processed, links_found=excluded.links_found,
+        links_saved=excluded.links_saved, status=excluded.status,
+        last_error=excluded.last_error, updated_at=CURRENT_TIMESTAMP
+    `).run(operationId, accountId, String(dialogId), fields.cursor, fields.lastMessageId,
+      fields.oldestMessageAt, fields.messagesProcessed, fields.pagesProcessed,
+      fields.linksFound, fields.linksSaved, fields.status, fields.lastError);
+  },
+  markStatus: (operationId, accountId, dialogId, status, lastError = null) => getDb().prepare(`
+    UPDATE links_search_checkpoints SET status=?, last_error=?, updated_at=CURRENT_TIMESTAMP
+    WHERE operation_id=? AND account_id=? AND dialog_id=?
+  `).run(status, lastError, operationId, accountId, String(dialogId)),
+};
+
+const linksSearchErrorQueries = {
+  add: (operationId, details) => getDb().prepare(`
+    INSERT INTO links_search_errors (operation_id, account_id, dialog_id, cursor, category, message, retry_count)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(operationId, details.accountId ?? null, details.dialogId == null ? null : String(details.dialogId),
+    details.cursor ?? null, details.category || 'unknown', String(details.message || 'Unknown error').slice(0, 1000), Number(details.retryCount) || 0),
+};
+
 const linksFoundQueries = {
   /**
    * Persist one found link (ignores duplicate url_hash per operation).
    */
+  insertMany: (userId, operationId, records, { deduplicateAcrossUser = true } = {}) => {
+    if (!records?.length) return { inserted: 0, duplicateSkipped: 0 };
+    const db = getDb();
+    const insertLink = db.prepare(`INSERT INTO links_found
+      (user_id, operation_id, url, url_hash, link_type, account_id, dialog_id, message_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+    const insertIdentity = db.prepare(`INSERT OR IGNORE INTO links_idempotency
+      (identity_key, user_id, operation_id, url_hash) VALUES (?, ?, ?, ?)`);
+    let inserted = 0;
+    let duplicateSkipped = 0;
+    const insertedRecords = [];
+    const transaction = db.transaction(() => {
+      for (const record of records) {
+        const identityKey = deduplicateAcrossUser
+          ? `${String(userId)}:${record.urlHash}`
+          : `${String(userId)}:${operationId}:${record.urlHash}`;
+        const guard = insertIdentity.run(identityKey, String(userId), operationId, record.urlHash);
+        if (!guard.changes) { duplicateSkipped++; continue; }
+        insertLink.run(String(userId), operationId, record.url, record.urlHash, record.linkType,
+          record.accountId ?? null, String(record.dialogId ?? ''), String(record.messageId ?? ''));
+        inserted++;
+        insertedRecords.push(record);
+      }
+    });
+    transaction();
+    return { inserted, duplicateSkipped, insertedRecords };
+  },
+
   insert: (userId, operationId, url, urlHash, linkType, accountId, dialogId, messageId) => {
     getDb()
       .prepare(`
@@ -492,6 +636,8 @@ const linksResultFilesQueries = {
 module.exports = {
   initLinksSchema,
   linksOperationQueries,
+  linksCheckpointQueries,
+  linksSearchErrorQueries,
   linksFoundQueries,
   linksStatsQueries,
   linksSettingsQueries,

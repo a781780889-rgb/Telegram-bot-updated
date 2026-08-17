@@ -1,58 +1,164 @@
-/**
- * Links Search Service
- * Core engine for scanning Telegram accounts and extracting links
- */
 
+/**
+ * Reliable Telegram link-search service.
+ *
+ * The search contract is deliberately page-oriented: fetch one page, parse and
+ * persist the entire page, then advance the checkpoint. A cursor is never
+ * advanced before persistence succeeds, which makes retries and restarts safe.
+ */
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const logger = require('../utils/logger');
 const { accountQueries, botUserQueries } = require('../database/db');
-const { linksOperationQueries, linksFoundQueries, linksSettingsQueries, linksResultFilesQueries } = require('../database/linksDb');
+const {
+  linksOperationQueries,
+  linksCheckpointQueries,
+  linksSearchErrorQueries,
+  linksFoundQueries,
+  linksSettingsQueries,
+  linksResultFilesQueries,
+} = require('../database/linksDb');
 
-// ─── Link Patterns ────────────────────────────────────────────────────────────
-
-const TELEGRAM_PATTERN = /(?:https?:\/\/)?(?:t(?:elegram)?\.me|telegram\.org)\/[^\s<>"']+/gi;
-// Public WhatsApp group invite links only. wa.me, message, phone, and API links are excluded.
+const TELEGRAM_PATTERN = /(?:https?:\/\/)?(?:t(?:elegram)?\.me|telegram\.org)\/[^^\s<>'"\])]+/gi;
 const WHATSAPP_GROUP_PATTERN = /(?:https?:\/\/)?chat\.whatsapp\.com\/[A-Za-z0-9_-]{10,}/gi;
+const TRAILING_PUNCTUATION = /[.,;!?،؛\)\]}>'"،]+$/u;
+const DEEP_MESSAGE_LIMIT = Math.max(1000, Number(process.env.LINKS_DEEP_MESSAGE_LIMIT || 5000));
+const PAGE_SIZE = Math.max(50, Math.min(1000, Number(process.env.LINKS_PAGE_SIZE || 500)));
+const SEARCH_REQUEST_TIMEOUT_MS = Math.max(15000, Number(process.env.LINKS_REQUEST_TIMEOUT_MS || 90000));
+const MAX_RETRIES = Math.max(1, Number(process.env.LINKS_MAX_RETRIES || 4));
+const activeSearches = new Map();
 
-/**
- * Extract links from text
- * @param {string} text
- * @param {'both'|'telegram'|'whatsapp'} linkType
- * @returns {Array<{url: string, type: 'telegram'|'whatsapp'}>}
- */
-const extractLinks = (text, linkType = 'both') => {
-  if (!text) return [];
-  const found = [];
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const safeFilePart = (value) => String(value || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 40);
+const progressCount = (linksCount, type) => (typeof linksCount === 'object' ? Number(linksCount[type] || 0) : Number(linksCount) || 0);
 
-  if (linkType === 'both' || linkType === 'telegram') {
-    const telegramMatches = text.match(TELEGRAM_PATTERN) || [];
-    telegramMatches.forEach((url) => {
-      const clean = url.replace(/[.,;!?)]+$/, '').trim();
-      if (clean.length > 5) found.push({ url: clean, type: 'telegram' });
-    });
-  }
-
-  if (linkType === 'both' || linkType === 'whatsapp') {
-    const waMatches = text.match(WHATSAPP_GROUP_PATTERN) || [];
-    waMatches.forEach((url) => {
-      const clean = url.replace(/[.,;!?)]+$/, '').trim();
-      if (clean.length > 5) found.push({ url: clean, type: 'whatsapp' });
-    });
-  }
-
-  return found;
+const resolvePeriod = (period, customStart, customEnd) => {
+  const toDate = customEnd ? new Date(customEnd) : new Date();
+  const fromDate = period === 'week' ? new Date(Date.now() - 7 * 86400000)
+    : period === 'month' ? new Date(Date.now() - 30 * 86400000)
+      : period === '3months' ? new Date(Date.now() - 90 * 86400000)
+        : period === 'year' ? new Date(Date.now() - 365 * 86400000)
+          : period === 'custom' ? (customStart ? new Date(customStart) : new Date(Date.now() - 30 * 86400000))
+            : new Date(Date.now() - 30 * 86400000);
+  return { fromDate, toDate };
 };
 
-/**
- * Compute SHA-256 hash of a URL for deduplication
- * @param {string} url
- * @returns {string}
- */
-const hashUrl = (url) => crypto.createHash('sha256').update(url.toLowerCase().trim()).digest('hex');
+const depthToLimit = (depth) => ({ fast: 100, medium: 500, deep: DEEP_MESSAGE_LIMIT }[depth] ?? 500);
+const depthPageLimit = (depth) => depth === 'fast' ? 1 : Number.POSITIVE_INFINITY;
 
-const safeFilePart = (value) => String(value || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 40);
+const cleanUrl = (value) => String(value || '').trim().replace(TRAILING_PUNCTUATION, '');
+const classifyUrl = (value) => {
+  const url = cleanUrl(value);
+  const candidate = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+  try {
+    const parsed = new URL(candidate);
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
+    if (host === 't.me' || host === 'telegram.me' || host === 'telegram.org') return 'telegram';
+    if (host === 'chat.whatsapp.com') return 'whatsapp';
+  } catch (_) {}
+  return null;
+};
+
+const normalizeUrl = (value) => {
+  const raw = cleanUrl(value);
+  if (!raw) return null;
+  const candidate = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+  try {
+    const parsed = new URL(candidate);
+    parsed.protocol = 'https:';
+    parsed.hostname = parsed.hostname.toLowerCase();
+    parsed.hash = '';
+    return parsed.toString().replace(/\/$/, '');
+  } catch (_) {
+    return null;
+  }
+};
+
+const hashUrl = (url) => crypto.createHash('sha256').update(String(url).toLowerCase().trim()).digest('hex');
+
+const extractLinks = (text, linkType = 'both', entities = []) => {
+  const source = String(text || '');
+  const values = [];
+  values.push(...(linkType === 'both' || linkType === 'telegram' ? (source.match(TELEGRAM_PATTERN) || []) : []));
+  values.push(...(linkType === 'both' || linkType === 'whatsapp' ? (source.match(WHATSAPP_GROUP_PATTERN) || []) : []));
+  for (const entity of Array.isArray(entities) ? entities : []) {
+    if (entity?.url) values.push(entity.url);
+  }
+  const seen = new Set();
+  return values.flatMap((raw) => {
+    const type = classifyUrl(raw);
+    const normalized = normalizeUrl(raw);
+    if (!type || !normalized || (linkType !== 'both' && linkType !== type) || seen.has(`${type}:${normalized}`)) return [];
+    seen.add(`${type}:${normalized}`);
+    return [{ url: normalized, rawUrl: cleanUrl(raw), type }];
+  });
+};
+
+const getMessageDate = (message) => {
+  if (!message?.date) return null;
+  const date = message.date instanceof Date ? message.date : new Date(Number(message.date) * 1000);
+  return Number.isNaN(date.getTime()) ? null : date;
+};
+const getMessageText = (message) => message?.message || message?.text || '';
+const getMessageEntities = (message) => message?.entities || message?.message?.entities || [];
+
+const errorCategory = (error) => {
+  const message = String(error?.message || error || '').toUpperCase();
+  if (message.includes('FLOOD_WAIT') || message.includes('FLOODWAIT')) return 'rate_limit';
+  if (message.includes('TIMEOUT') || message.includes('ETIMEDOUT') || message.includes('NETWORK') || message.includes('ECONN')) return 'network';
+  if (message.includes('AUTH') || message.includes('SESSION')) return 'authentication';
+  if (message.includes('SQLITE') || message.includes('DATABASE')) return 'database';
+  return 'telegram_api';
+};
+const floodWaitSeconds = (error) => {
+  const match = String(error?.message || error || '').match(/(?:FLOOD_WAIT|FLOODWAIT)[_ ]?(\d+)/i);
+  return match ? Math.max(1, Number(match[1])) : 0;
+};
+
+const withTimeout = (promise, timeoutMs, message) => Promise.race([
+  promise,
+  new Promise((_, reject) => setTimeout(() => reject(new Error(message)), timeoutMs)),
+]);
+
+const updateOperation = (operationId, updates) => {
+  try { linksOperationQueries.updateProgress(operationId, updates); } catch (error) { logger.error(`Unable to update link operation ${operationId}:`, error); }
+};
+
+const retry = async (operationId, operationContext, fn, state) => {
+  let lastError;
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try { return await fn(); } catch (error) {
+      lastError = error;
+      const category = errorCategory(error);
+      const waitSeconds = floodWaitSeconds(error);
+      linksSearchErrorQueries.add(operationId, { ...operationContext, category, message: error.message, retryCount: attempt });
+      updateOperation(operationId, {
+        retry_count: (state.retryCount || 0) + 1,
+        flood_wait_count: (state.floodWaitCount || 0) + (waitSeconds ? 1 : 0),
+        status: waitSeconds ? 'paused_rate_limit' : 'running',
+        last_error: error.message,
+      });
+      state.retryCount = (state.retryCount || 0) + 1;
+      if (waitSeconds) {
+        state.progress.isPaused = true;
+        await state.onProgress({ ...state.progress });
+        await sleep(waitSeconds * 1000);
+        state.progress.isPaused = false;
+        updateOperation(operationId, { status: 'resuming', last_resume_at: new Date().toISOString(), resume_count: 1 });
+      } else if (attempt < MAX_RETRIES) {
+        await sleep(Math.min(30000, 500 * (2 ** (attempt - 1)) + Math.floor(Math.random() * 250)));
+      }
+    }
+  }
+  throw lastError;
+};
+
+const buildEntities = (message) => {
+  const entities = getMessageEntities(message);
+  return entities.map((entity) => entity?.url || entity?.text_url).filter(Boolean);
+};
+
 const registerAdminResultFiles = ({ operationId, userId, wizard, outputDir, files, linksCount }) => {
   try {
     const settings = linksSettingsQueries.get(userId);
@@ -61,512 +167,196 @@ const registerAdminResultFiles = ({ operationId, userId, wizard, outputDir, file
     const userDir = path.join(adminRoot, safeFilePart(userId));
     fs.mkdirSync(userDir, { recursive: true });
     const botUser = botUserQueries.getByTelegramUserId(userId);
-    const searchQuery = wizard.searchQuery || `${wizard.linkType || 'both'} | ${wizard.period || 'unknown'}`;
     const records = [];
     for (const sourceName of files) {
-      if (!sourceName.toLowerCase().endsWith('.txt')) continue;
+      if (!sourceName.endsWith('.txt')) continue;
       const sourcePath = path.join(outputDir, sourceName);
       if (!fs.existsSync(sourcePath)) continue;
       const uniqueId = `rf_${operationId}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
       const fileName = `search_${safeFilePart(wizard.linkType || 'links')}_${safeFilePart(userId)}_${timestamp}_${operationId}_${safeFilePart(sourceName)}`;
       const targetPath = path.join(userDir, `${uniqueId}_${fileName}`);
       fs.copyFileSync(sourcePath, targetPath);
-      records.push(linksResultFilesQueries.create({
-        fileId: uniqueId,
-        operationId,
-        userId,
-        username: botUser?.username || null,
-        searchQuery,
-        fileName,
-        filePath: targetPath,
-        linksCount: sourceName === 'Telegram_Links.txt' ? progressCount(linksCount, 'telegram') : sourceName === 'Whatsapp_Links.txt' ? progressCount(linksCount, 'whatsapp') : linksCount,
-        fileSize: fs.statSync(targetPath).size,
-      }));
+      records.push(linksResultFilesQueries.create({ fileId: uniqueId, operationId, userId, username: botUser?.username || null, searchQuery: wizard.searchQuery || `${wizard.linkType || 'both'} | ${wizard.period || 'unknown'}`, fileName, filePath: targetPath, linksCount: sourceName === 'Telegram_Links.txt' ? progressCount(linksCount, 'telegram') : sourceName === 'Whatsapp_Links.txt' ? progressCount(linksCount, 'whatsapp') : linksCount, fileSize: fs.statSync(targetPath).size }));
     }
     return records;
-  } catch (error) {
-    logger.error(`Admin result-file copy failed for operation ${operationId}:`, error);
-    return [];
-  }
-};
-const progressCount = (linksCount, type) => (typeof linksCount === 'object' ? Number(linksCount[type] || 0) : Number(linksCount) || 0);
-
-// ─── Period → Date ────────────────────────────────────────────────────────────
-
-/**
- * @param {string} period
- * @param {string|null} customStart
- * @param {string|null} customEnd
- * @returns {{ fromDate: Date, toDate: Date }}
- */
-const resolvePeriod = (period, customStart, customEnd) => {
-  const toDate = new Date();
-  let fromDate;
-
-  switch (period) {
-    case 'week':
-      fromDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-      break;
-    case 'month':
-      fromDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-      break;
-    case '3months':
-      fromDate = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
-      break;
-    case 'year':
-      fromDate = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000);
-      break;
-    case 'custom':
-      fromDate = customStart ? new Date(customStart) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-      return { fromDate, toDate: customEnd ? new Date(customEnd) : toDate };
-    default:
-      fromDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-  }
-
-  return { fromDate, toDate };
+  } catch (error) { logger.error(`Admin result-file copy failed for operation ${operationId}:`, error); return []; }
 };
 
-// ─── Search Depth → Message Limit ────────────────────────────────────────────
+const updateElapsed = (progress, startedAt) => {
+  progress.elapsedSeconds = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
+  progress.speed = progress.elapsedSeconds ? Math.round(progress.scannedMessages / progress.elapsedSeconds) : 0;
+};
+const dirSize = (dir) => { try { return fs.readdirSync(dir).reduce((sum, file) => sum + (fs.statSync(path.join(dir, file)).size || 0), 0); } catch (_) { return 0; } };
+const buildReport = (progress, wizard, accounts, startTime, completionReason) => [
+  '══════════════════════════════════════', '         تقرير عملية البحث عن الروابط', '══════════════════════════════════════',
+  `وقت البداية : ${new Date(startTime).toLocaleString('ar-SA')}`, `وقت الانتهاء: ${new Date().toLocaleString('ar-SA')}`,
+  `مستوى البحث  : ${wizard.searchDepth}`, `الفترة       : ${wizard.period}`, `سبب الانتهاء : ${completionReason || 'غير مكتمل'}`, `عدد الحسابات : ${accounts.length}`, '',
+  `المحادثات المفحوصة : ${progress.scannedChats}`, `الرسائل المفحوصة   : ${progress.scannedMessages}`, `روابط تيليجرام     : ${progress.telegramLinks}`, `روابط واتساب       : ${progress.whatsappLinks}`, `إجمالي الروابط     : ${progress.totalLinks}`, `المكررة المتخطاة   : ${progress.duplicatesRemoved}`, `الروابط المحفوظة   : ${progress.savedLinks}`, '══════════════════════════════════════',
+].join('\n');
 
-const DEEP_MESSAGE_LIMIT = Math.max(1000, Number(process.env.LINKS_DEEP_MESSAGE_LIMIT || 5000));
-const SEARCH_REQUEST_TIMEOUT_MS = Math.max(15000, Number(process.env.LINKS_REQUEST_TIMEOUT_MS || 90000));
-const depthToLimit = (depth) => {
-  const map = { fast: 100, medium: 500, deep: DEEP_MESSAGE_LIMIT };
-  return map[depth] ?? 500;
+const pauseSearch = (userId) => { const state = activeSearches.get(String(userId)); if (state) { state.paused = true; state.progress.isPaused = true; updateOperation(state.operationId, { status: 'paused' }); } };
+const resumeSearch = (userId) => { const state = activeSearches.get(String(userId)); if (state) { state.paused = false; state.progress.isPaused = false; updateOperation(state.operationId, { status: 'resuming', last_resume_at: new Date().toISOString() }); } };
+const stopSearch = (userId) => { const state = activeSearches.get(String(userId)); if (state) { state.stopped = true; updateOperation(state.operationId, { status: 'stopping' }); } };
+const getProgress = (userId) => activeSearches.get(String(userId))?.progress || null;
+const hasActiveSearch = (userId) => activeSearches.has(String(userId));
+
+const waitIfPaused = async (state) => {
+  while (state.paused && !state.stopped) { state.progress.isPaused = true; await state.onProgress({ ...state.progress }); await sleep(500); }
+  state.progress.isPaused = false;
 };
 
-// ─── Active Search State ──────────────────────────────────────────────────────
-
-// userId -> { operationId, paused, stopped, progress }
-const activeSearches = new Map();
-
-/**
- * Mark search as paused
- * @param {string} userId
- */
-const pauseSearch = (userId) => {
-  const state = activeSearches.get(userId);
-  if (state) state.paused = true;
-};
-
-/**
- * Mark search as resumed
- * @param {string} userId
- */
-const resumeSearch = (userId) => {
-  const state = activeSearches.get(userId);
-  if (state) state.paused = false;
-};
-
-/**
- * Stop search gracefully
- * @param {string} userId
- */
-const stopSearch = (userId) => {
-  const state = activeSearches.get(userId);
-  if (state) state.stopped = true;
-};
-
-/**
- * Get current progress snapshot
- * @param {string} userId
- */
-const getProgress = (userId) => {
-  return activeSearches.get(userId)?.progress || null;
-};
-
-/**
- * Check if user has active search
- * @param {string} userId
- */
-const hasActiveSearch = (userId) => activeSearches.has(userId);
-
-// ─── Core Search Engine ───────────────────────────────────────────────────────
-
-/**
- * Run the link search for a given operation
- * @param {string} userId
- * @param {number} operationId
- * @param {object} wizard - wizard config
- * @param {Function} onProgress - callback(progress) called periodically
- */
-const runSearch = async (userId, operationId, wizard, onProgress) => {
-  const startTime = Date.now();
-
-  const progress = {
-    currentAccount: '',
-    doneAccounts: 0,
-    remainingAccounts: 0,
-    scannedMessages: 0,
-    scannedChats: 0,
-    totalLinks: 0,
-    telegramLinks: 0,
-    whatsappLinks: 0,
-    duplicatesRemoved: 0,
-    newLinks: 0,
-    savedLinks: 0,
-    speed: 0,
-    elapsedSeconds: 0,
-    etaSeconds: null,
-    percent: 0,
-    lastAction: '',
-    lastLink: '',
-    isPaused: false,
-  };
-
-  const state = { operationId, paused: false, stopped: false, progress };
-  activeSearches.set(userId, state);
-
-  try {
-    const settings = linksSettingsQueries.get(userId);
-    const { fromDate, toDate } = resolvePeriod(wizard.period, wizard.customStart, wizard.customEnd);
-    const msgLimit = depthToLimit(wizard.searchDepth);
-    progress.lastAction = wizard.searchDepth === 'deep'
-      ? `🔬 الفحص العميق مفعل — حتى ${msgLimit} رسالة لكل محادثة`
-      : `جارٍ بدء الفحص (${wizard.searchDepth})`;
-    await onProgress({ ...progress });
-
-    // Resolve accounts to search
-    let accounts = [];
-    if (wizard.accountMode === 'all') {
-      accounts = accountQueries.getAllByUserId(userId).filter((a) => a.status === 'connected');
-    } else {
-      const ids = wizard.selectedAccountIds || [];
-      accounts = ids
-        .map((id) => accountQueries.getById(id))
-        .filter((a) => a && a.user_id === userId && a.status === 'connected');
+const processPage = async ({ userId, operationId, account, dialog, messages, wizard, settings, progress, state }) => {
+  const records = [];
+  const pageSeen = new Set();
+  for (const message of messages) {
+    if (state.stopped) break;
+    const date = getMessageDate(message);
+    if (date && (date > state.toDate || date < state.fromDate)) continue;
+    progress.scannedMessages++;
+    const links = extractLinks(getMessageText(message), wizard.linkType, buildEntities(message));
+    for (const link of links) {
+      progress.linksExtracted++;
+      const key = link.type + ':' + hashUrl(link.url);
+      if (pageSeen.has(key)) { progress.duplicatesRemoved++; continue; }
+      pageSeen.add(key);
+      records.push({ url: link.url, urlHash: hashUrl(link.url), linkType: link.type, accountId: account.id, dialogId: dialog.id, messageId: message.id });
     }
+  }
+  progress.linksValidated += records.length;
+  const result = linksFoundQueries.insertMany(userId, operationId, records, { deduplicateAcrossUser: Boolean(settings.remove_duplicates) });
+  progress.duplicatesRemoved += result.duplicateSkipped;
+  progress.savedLinks += result.inserted;
+  progress.newLinks += result.inserted;
+  for (const record of result.insertedRecords || []) {
+    if (record.linkType === 'telegram') { progress.telegramLinks++; progress.collectedTelegram.add(record.url); }
+    else { progress.whatsappLinks++; progress.collectedWhatsapp.add(record.url); }
+  }
+  progress.totalLinks = progress.telegramLinks + progress.whatsappLinks;
+  return { records, ...result };
+};
 
+const paginateDialog = async ({ userId, operationId, account, dialog, client, wizard, settings, fromDate, toDate, progress, state }) => {
+  const checkpoint = linksCheckpointQueries.get(operationId, account.id, dialog.id);
+  let cursor = checkpoint?.current_cursor ? Number(checkpoint.current_cursor) : 0;
+  let pages = Number(checkpoint?.pages_processed || 0);
+  let messagesProcessed = Number(checkpoint?.messages_processed || 0);
+  let linksFound = Number(checkpoint?.links_found || 0);
+  let linksSaved = Number(checkpoint?.links_saved || 0);
+  let reason = null;
+  const maxPages = depthPageLimit(wizard.searchDepth);
+
+  while (!state.stopped && pages < maxPages) {
+    await waitIfPaused(state);
+    const page = await retry(operationId, { accountId: account.id, dialogId: dialog.id, cursor }, () => withTimeout(client.getMessages(dialog.entity, { limit: PAGE_SIZE, offsetId: cursor || undefined }), SEARCH_REQUEST_TIMEOUT_MS, 'انتهت مهلة قراءة صفحة الرسائل'), state);
+    const messages = Array.isArray(page) ? page : [];
+    if (!messages.length) { reason = 'END_OF_MESSAGES'; break; }
+    const oldest = messages.reduce((current, item) => (!current || Number(item.id) < Number(current.id) ? item : current), null);
+    const oldestDate = getMessageDate(oldest);
+    await processPage({ userId, operationId, account, dialog, messages, wizard, settings, progress, state });
+    pages++;
+    messagesProcessed += messages.length;
+    linksFound = progress.linksExtracted;
+    linksSaved = progress.savedLinks;
+    const nextCursor = Number(oldest?.id || 0);
+    if (!nextCursor || nextCursor === cursor) {
+      linksCheckpointQueries.save(operationId, account.id, dialog.id, { currentCursor: cursor, lastMessageId: oldest?.id, oldestMessageTimestamp: oldestDate?.toISOString(), messagesProcessed, pagesProcessed: pages, linksFound, linksSaved, status: 'failed', lastError: 'CURSOR_STALLED' });
+      linksSearchErrorQueries.add(operationId, { accountId: account.id, dialogId: dialog.id, cursor, category: 'pagination', message: 'Cursor did not advance', retryCount: 0 });
+      throw new Error(`Pagination cursor stalled for dialog ${dialog.id}`);
+    }
+    cursor = nextCursor;
+    const reachedDate = oldestDate && oldestDate < fromDate;
+    linksCheckpointQueries.save(operationId, account.id, dialog.id, { currentCursor: cursor, lastMessageId: oldest?.id, oldestMessageTimestamp: oldestDate?.toISOString(), messagesProcessed, pagesProcessed: pages, linksFound, linksSaved, status: reachedDate ? 'completed' : 'running' });
+    updateOperation(operationId, { status: 'running', current_cursor: String(cursor), last_message_id: String(oldest?.id || ''), pages_completed: pages, messages_scanned: progress.scannedMessages, links_extracted: progress.linksExtracted, links_validated: progress.linksValidated, links_saved: progress.savedLinks, duplicates_skipped: progress.duplicatesRemoved, telegram_links: progress.telegramLinks, whatsapp_links: progress.whatsappLinks, total_links: progress.totalLinks, saved_links: progress.savedLinks, chats_scanned: progress.scannedChats });
+    updateElapsed(progress, state.startTime);
+    await state.onProgress({ ...progress });
+    if (reachedDate) { reason = 'DATE_RANGE_REACHED'; break; }
+  }
+  if (!reason && pages >= maxPages) reason = wizard.searchDepth === 'fast' ? 'DEPTH_LIMIT_REACHED' : 'TARGET_MESSAGE_REACHED';
+  return { reason, pages, messagesProcessed };
+};
+
+const runSearch = async (userId, operationId, wizard, onProgress = async () => {}) => {
+  const uid = String(userId);
+  if (activeSearches.has(uid)) throw new Error('يوجد بحث نشط لهذا المستخدم بالفعل');
+  const existing = linksOperationQueries.getById(operationId);
+  if (!existing || String(existing.user_id) !== uid) throw new Error('عملية البحث غير صالحة');
+  const startTime = Date.now();
+  const { fromDate, toDate } = resolvePeriod(wizard.period, wizard.customStart, wizard.customEnd);
+  const progress = { currentAccount: '', doneAccounts: 0, remainingAccounts: 0, scannedMessages: 0, scannedChats: 0, totalLinks: 0, telegramLinks: 0, whatsappLinks: 0, duplicatesRemoved: 0, newLinks: 0, savedLinks: 0, linksExtracted: 0, linksValidated: 0, speed: 0, elapsedSeconds: 0, etaSeconds: null, percent: 0, lastAction: '', lastLink: '', isPaused: false, pages: 0, collectedTelegram: new Set(), collectedWhatsapp: new Set() };
+  const state = { operationId, paused: false, stopped: false, progress, startTime, fromDate, toDate, retryCount: 0, floodWaitCount: 0, onProgress };
+  activeSearches.set(uid, state);
+  try {
+    const settings = linksSettingsQueries.get(uid);
+    const accounts = (wizard.accountMode === 'all' ? accountQueries.getAllByUserId(uid) : (wizard.selectedAccountIds || []).map((id) => accountQueries.getById(id))).filter((account) => account && account.user_id === uid && account.status === 'connected');
     progress.remainingAccounts = accounts.length;
-
-    const outputDir = path.join(
-      settings.output_dir,
-      userId,
-      `op_${operationId}_${Date.now()}`
-    );
+    const outputDir = path.join(settings.output_dir, uid, `op_${operationId}_${Date.now()}`);
     fs.mkdirSync(outputDir, { recursive: true });
-
-    const collectedTelegram = new Set();
-    const collectedWhatsapp = new Set();
-
-    // ── Iterate accounts ──────────────────────────────────────────────────────
-    for (let ai = 0; ai < accounts.length; ai++) {
-      if (state.stopped) break;
-
+    updateOperation(operationId, { status: 'running', resume_count: Number(existing.resume_count || 0) + (existing.status !== 'pending' ? 1 : 0), last_resume_at: existing.status !== 'pending' ? new Date().toISOString() : null });
+    await onProgress({ ...progress });
+    for (let ai = 0; ai < accounts.length && !state.stopped; ai++) {
       const account = accounts[ai];
-      progress.currentAccount =
-        [account.first_name, account.last_name].filter(Boolean).join(' ') || account.phone;
+      progress.currentAccount = [account.first_name, account.last_name].filter(Boolean).join(' ') || account.phone;
       progress.remainingAccounts = accounts.length - ai;
       progress.lastAction = `جارٍ تحميل حساب ${progress.currentAccount}`;
-      progress.percent = Math.round((ai / accounts.length) * 80);
-      _updateElapsed(progress, startTime);
-      await onProgress({ ...progress });
-
-      let client = null;
+      let client;
       try {
         const { loadSession, restoreSessionFile } = require('./telegramClient');
         const sessionFile = restoreSessionFile(account) || account.session_file;
-        if (!sessionFile) {
-          progress.lastAction = `⚠️ لا توجد جلسة محفوظة لـ ${progress.currentAccount}`;
-          await onProgress({ ...progress });
-          continue;
-        }
-        client = await withTimeout(loadSession(sessionFile), SEARCH_REQUEST_TIMEOUT_MS, 'انتهت مهلة تحميل الجلسة');
-      } catch (sessionErr) {
-        logger.warn(`Cannot load session for account ${account.id}:`, sessionErr.message);
-        progress.lastAction = `⚠️ فشل تحميل جلسة ${progress.currentAccount}`;
-        await onProgress({ ...progress });
-        continue;
-      }
-
-      try {
-        // Get all dialogs
-        const dialogs = await withTimeout(client.getDialogs({ limit: 500 }), SEARCH_REQUEST_TIMEOUT_MS, 'انتهت مهلة تحميل المحادثات');
-        const totalDialogs = dialogs.length;
-
-        for (let di = 0; di < dialogs.length; di++) {
-          if (state.stopped) break;
-
-          // Pause support
-          while (state.paused && !state.stopped) {
-            progress.isPaused = true;
-            await _sleep(500);
-          }
-          progress.isPaused = false;
-
+        if (!sessionFile) throw new Error('لا توجد جلسة محفوظة');
+        client = await retry(operationId, { accountId: account.id, category: 'session' }, () => withTimeout(loadSession(sessionFile), SEARCH_REQUEST_TIMEOUT_MS, 'انتهت مهلة تحميل الجلسة'), state);
+        const dialogs = await retry(operationId, { accountId: account.id, category: 'dialogs' }, () => withTimeout(client.getDialogs({ limit: 500 }), SEARCH_REQUEST_TIMEOUT_MS, 'انتهت مهلة تحميل المحادثات'), state);
+        for (let di = 0; di < dialogs.length && !state.stopped; di++) {
           const dialog = dialogs[di];
           progress.scannedChats++;
           progress.lastAction = `فحص محادثة: ${(dialog.name || 'محادثة').slice(0, 30)}`;
-
-          // Sub-progress within account
-          const accountPct = ((di / totalDialogs) * 80) / accounts.length;
-          progress.percent = Math.round((ai / accounts.length) * 80 + accountPct);
-          _updateElapsed(progress, startTime);
-
-          if (di % 10 === 0) {
-            await onProgress({ ...progress });
-          }
-
-          try {
-            const iterParams = { limit: msgLimit || undefined };
-            const messages = await withTimeout(client.getMessages(dialog.entity, iterParams), SEARCH_REQUEST_TIMEOUT_MS, 'انتهت مهلة قراءة المحادثة');
-
-            const chatSeenHashes = new Set();
-
-            for (const msg of messages) {
-              if (state.stopped) break;
-
-              const msgDate = new Date(msg.date * 1000);
-              if (msgDate < fromDate || msgDate > toDate) continue;
-
-              const text = msg.message || '';
-              progress.scannedMessages++;
-
-              if (progress.scannedMessages % 100 === 0) {
-                _updateElapsed(progress, startTime);
-                await onProgress({ ...progress });
-                linksOperationQueries.updateProgress(operationId, {
-                  status: 'running',
-                  chats_scanned: progress.scannedChats,
-                  messages_scanned: progress.scannedMessages,
-                  telegram_links: progress.telegramLinks,
-                  whatsapp_links: progress.whatsappLinks,
-                  total_links: progress.totalLinks,
-                  saved_links: progress.savedLinks,
-                });
-              }
-
-              const links = extractLinks(text, wizard.linkType);
-
-              for (const { url, type } of links) {
-                const hash = hashUrl(url);
-
-                // Check dedup: within chat
-                if (chatSeenHashes.has(hash)) {
-                  progress.duplicatesRemoved++;
-                  continue;
-                }
-
-                // Check dedup: across all sessions for this user
-                if (settings.remove_duplicates) {
-                  if (linksFoundQueries.existsForUser(userId, hash)) {
-                    progress.duplicatesRemoved++;
-                    chatSeenHashes.add(hash);
-                    continue;
-                  }
-                }
-
-                chatSeenHashes.add(hash);
-
-                // Save to DB
-                linksFoundQueries.insert(
-                  userId,
-                  operationId,
-                  url,
-                  hash,
-                  type,
-                  account.id,
-                  String(dialog.id),
-                  String(msg.id)
-                );
-
-                progress.totalLinks++;
-                progress.newLinks++;
-                progress.savedLinks++;
-                progress.lastLink = url;
-
-                if (type === 'telegram') {
-                  progress.telegramLinks++;
-                  collectedTelegram.add(url);
-                } else {
-                  progress.whatsappLinks++;
-                  collectedWhatsapp.add(url);
-                }
-
-                if (progress.scannedMessages % 50 === 0) {
-                  await onProgress({ ...progress });
-                }
-              }
-            }
-          } catch (msgErr) {
-            logger.warn(`Error reading dialog ${dialog.id}:`, msgErr.message);
-          }
+          await paginateDialog({ userId: uid, operationId, account, dialog, client, wizard, settings, fromDate, toDate, progress, state });
+          progress.pages++;
+          progress.percent = Math.min(95, Math.round(((ai + (di + 1) / Math.max(1, dialogs.length)) / Math.max(1, accounts.length)) * 90));
+          await onProgress({ ...progress });
         }
-      } catch (dialogErr) {
-        logger.error(`Error getting dialogs for account ${account.id}:`, dialogErr.message);
+      } catch (error) {
+        updateOperation(operationId, { status: 'error', last_error: error.message, pages_failed: 1 });
+        linksSearchErrorQueries.add(operationId, { accountId: account.id, category: errorCategory(error), message: error.message, retryCount: state.retryCount });
+        throw error;
       } finally {
-        try {
-          await client.disconnect();
-        } catch (_) {}
+        if (client) { try { await client.disconnect(); } catch (_) {} }
       }
-
       progress.doneAccounts++;
       progress.remainingAccounts = accounts.length - ai - 1;
     }
-
-    // ── Write output files ────────────────────────────────────────────────────
+    const completionReason = state.stopped ? 'USER_CANCELLED' : 'DATE_RANGE_REACHED';
     progress.lastAction = 'جارٍ حفظ الملفات...';
     progress.percent = 90;
-    await onProgress({ ...progress });
-
-    const allUrls = [...collectedTelegram, ...collectedWhatsapp];
-    const telegramContent = [...collectedTelegram].join('\n');
-    const whatsappContent = [...collectedWhatsapp].join('\n');
-    const allContent = allUrls.join('\n');
-
-    const reportContent = _buildReport(progress, wizard, accounts, startTime);
-    const statsJson = JSON.stringify(
-      {
-        operationId,
-        telegramLinks: progress.telegramLinks,
-        whatsappLinks: progress.whatsappLinks,
-        totalLinks: progress.totalLinks,
-        duplicatesRemoved: progress.duplicatesRemoved,
-        savedLinks: progress.savedLinks,
-        scannedMessages: progress.scannedMessages,
-        scannedChats: progress.scannedChats,
-        durationSeconds: Math.round((Date.now() - startTime) / 1000),
-        startedAt: new Date(startTime).toISOString(),
-        finishedAt: new Date().toISOString(),
-      },
-      null,
-      2
-    );
-
-    fs.writeFileSync(path.join(outputDir, 'Telegram_Links.txt'), telegramContent, 'utf-8');
-    fs.writeFileSync(path.join(outputDir, 'Whatsapp_Links.txt'), whatsappContent, 'utf-8');
-    fs.writeFileSync(path.join(outputDir, 'All_Links.txt'), allContent, 'utf-8');
-    fs.writeFileSync(path.join(outputDir, 'Search_Report.txt'), reportContent, 'utf-8');
-    fs.writeFileSync(path.join(outputDir, 'Statistics.json'), statsJson, 'utf-8');
-
-    // Create independent, uniquely named admin copies. A failure here is logged but never aborts the user's search.
-    const adminResultFiles = registerAdminResultFiles({
-      operationId,
-      userId,
-      wizard,
-      outputDir,
-      files: ['Telegram_Links.txt', 'Whatsapp_Links.txt', 'All_Links.txt', 'Search_Report.txt'],
-      linksCount: { telegram: progress.telegramLinks, whatsapp: progress.whatsappLinks, total: progress.totalLinks },
-    });
-
-    // Calculate total file size
-    const fileSize = _dirSize(outputDir);
-
-    // Update operation in DB
-    const finalStatus = state.stopped ? 'stopped' : 'completed';
-    linksOperationQueries.updateProgress(operationId, {
-      status: finalStatus,
-      accounts_used: progress.doneAccounts,
-      chats_scanned: progress.scannedChats,
-      messages_scanned: progress.scannedMessages,
-      telegram_links: progress.telegramLinks,
-      whatsapp_links: progress.whatsappLinks,
-      total_links: progress.totalLinks,
-      duplicates_removed: progress.duplicatesRemoved,
-      saved_links: progress.savedLinks,
-      file_size_bytes: fileSize,
-      output_dir: outputDir,
-    });
-    linksOperationQueries.finish(operationId, finalStatus);
-
+    const telegramContent = [...progress.collectedTelegram].join('\n');
+    const whatsappContent = [...progress.collectedWhatsapp].join('\n');
+    const allContent = [...progress.collectedTelegram, ...progress.collectedWhatsapp].join('\n');
+    fs.writeFileSync(path.join(outputDir, 'Telegram_Links.txt'), telegramContent, 'utf8');
+    fs.writeFileSync(path.join(outputDir, 'Whatsapp_Links.txt'), whatsappContent, 'utf8');
+    fs.writeFileSync(path.join(outputDir, 'All_Links.txt'), allContent, 'utf8');
+    fs.writeFileSync(path.join(outputDir, 'Search_Report.txt'), buildReport(progress, wizard, accounts, startTime, completionReason), 'utf8');
+    fs.writeFileSync(path.join(outputDir, 'Statistics.json'), JSON.stringify({ operationId, completionReason, telegramLinks: progress.telegramLinks, whatsappLinks: progress.whatsappLinks, totalLinks: progress.totalLinks, duplicatesRemoved: progress.duplicatesRemoved, savedLinks: progress.savedLinks, scannedMessages: progress.scannedMessages, scannedChats: progress.scannedChats, pages: progress.pages, retryCount: state.retryCount, floodWaitCount: state.floodWaitCount, startedAt: new Date(startTime).toISOString(), finishedAt: new Date().toISOString() }, null, 2), 'utf8');
+    const adminResultFiles = registerAdminResultFiles({ operationId, userId: uid, wizard, outputDir, files: ['Telegram_Links.txt', 'Whatsapp_Links.txt', 'All_Links.txt', 'Search_Report.txt'], linksCount: { telegram: progress.telegramLinks, whatsapp: progress.whatsappLinks, total: progress.totalLinks } });
+    updateOperation(operationId, { status: state.stopped ? 'cancelled' : 'completed', completion_reason: completionReason, accounts_used: progress.doneAccounts, chats_scanned: progress.scannedChats, messages_scanned: progress.scannedMessages, telegram_links: progress.telegramLinks, whatsapp_links: progress.whatsappLinks, total_links: progress.totalLinks, duplicates_removed: progress.duplicatesRemoved, saved_links: progress.savedLinks, links_extracted: progress.linksExtracted, links_validated: progress.linksValidated, retry_count: state.retryCount, flood_wait_count: state.floodWaitCount, pages_completed: progress.pages, file_size_bytes: dirSize(outputDir), output_dir: outputDir });
+    linksOperationQueries.finish(operationId, state.stopped ? 'cancelled' : 'completed', completionReason);
     progress.percent = 100;
-    _updateElapsed(progress, startTime);
-    progress.etaSeconds = 0;
+    updateElapsed(progress, startTime);
     await onProgress({ ...progress });
-
-    return {
-      operationId,
-      accountsSearched: progress.doneAccounts,
-      chatsScanned: progress.scannedChats,
-      messagesScanned: progress.scannedMessages,
-      telegramLinks: progress.telegramLinks,
-      whatsappLinks: progress.whatsappLinks,
-      totalLinks: progress.totalLinks,
-      duplicatesRemoved: progress.duplicatesRemoved,
-      savedLinks: progress.savedLinks,
-      durationSeconds: Math.round((Date.now() - startTime) / 1000),
-      startedAt: new Date(startTime).toISOString(),
-      finishedAt: new Date().toISOString(),
-      outputDir,
-      adminResultFiles: adminResultFiles.length,
-    };
+    return { operationId, accountsSearched: progress.doneAccounts, chatsScanned: progress.scannedChats, messagesScanned: progress.scannedMessages, telegramLinks: progress.telegramLinks, whatsappLinks: progress.whatsappLinks, totalLinks: progress.totalLinks, duplicatesRemoved: progress.duplicatesRemoved, savedLinks: progress.savedLinks, durationSeconds: Math.round((Date.now() - startTime) / 1000), startedAt: new Date(startTime).toISOString(), finishedAt: new Date().toISOString(), outputDir, adminResultFiles: adminResultFiles.length, completionReason };
   } catch (error) {
-    logger.error('runSearch error:', error);
-    linksOperationQueries.updateProgress(operationId, {
-      status: 'error',
-      error_message: error.message?.slice(0, 500),
-    });
-    linksOperationQueries.finish(operationId, 'error');
+    updateOperation(operationId, { status: 'error', error_message: error.message, last_error: error.message });
+    linksOperationQueries.finish(operationId, 'error', 'FAILED');
     throw error;
-  } finally {
-    activeSearches.delete(userId);
+  } finally { activeSearches.delete(uid); }
+};
+
+const resumeIncompleteSearches = async () => {
+  for (const operation of linksOperationQueries.listResumable()) {
+    if (activeSearches.has(String(operation.user_id))) continue;
+    const wizard = { accountMode: operation.account_mode || 'all', selectedAccountIds: JSON.parse(operation.selected_account_ids || '[]'), linkType: operation.link_type || 'both', period: operation.period || 'month', customStart: operation.custom_start, customEnd: operation.custom_end, searchDepth: operation.search_depth || 'medium', searchQuery: operation.search_query };
+    runSearch(operation.user_id, operation.id, wizard, async () => {}).catch((error) => logger.error(`Failed to resume link operation ${operation.id}:`, error));
   }
 };
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+module.exports = { runSearch, resumeIncompleteSearches, pauseSearch, resumeSearch, stopSearch, getProgress, hasActiveSearch, extractLinks, normalizeUrl, hashUrl, resolvePeriod, depthToLimit, paginateDialog };
 
-const _sleep = (ms) => new Promise((res) => setTimeout(res, ms));
-const withTimeout = (promise, timeoutMs, message) => Promise.race([
-  promise,
-  new Promise((_, reject) => setTimeout(() => reject(new Error(message)), timeoutMs)),
-]);
-
-const _updateElapsed = (progress, startTime) => {
-  progress.elapsedSeconds = Math.round((Date.now() - startTime) / 1000);
-  if (progress.scannedMessages > 0 && progress.elapsedSeconds > 0) {
-    progress.speed = Math.round(progress.scannedMessages / progress.elapsedSeconds);
-  }
-};
-
-const _dirSize = (dir) => {
-  try {
-    return fs
-      .readdirSync(dir)
-      .reduce((sum, f) => sum + (fs.statSync(path.join(dir, f)).size || 0), 0);
-  } catch (_) {
-    return 0;
-  }
-};
-
-const _buildReport = (progress, wizard, accounts, startTime) => {
-  const now = new Date();
-  const duration = Math.round((now - startTime) / 1000);
-  const lines = [
-    '══════════════════════════════════════',
-    '         تقرير عملية البحث عن الروابط',
-    '══════════════════════════════════════',
-    `وقت البداية : ${new Date(startTime).toLocaleString('ar-SA')}`,
-    `وقت الانتهاء: ${now.toLocaleString('ar-SA')}`,
-    `مدة البحث   : ${duration} ثانية`,
-    '',
-    '── الإعدادات ──────────────────────────',
-    `نوع الروابط  : ${wizard.linkType}`,
-    `الفترة       : ${wizard.period}`,
-    `مستوى البحث  : ${wizard.searchDepth}`,
-    `عدد الحسابات : ${accounts.length}`,
-    '',
-    '── النتائج ────────────────────────────',
-    `المحادثات المفحوصة : ${progress.scannedChats}`,
-    `الرسائل المفحوصة   : ${progress.scannedMessages}`,
-    `روابط تيليجرام     : ${progress.telegramLinks}`,
-    `روابط واتساب       : ${progress.whatsappLinks}`,
-    `إجمالي الروابط     : ${progress.totalLinks}`,
-    `مكررة محذوفة       : ${progress.duplicatesRemoved}`,
-    `الروابط المحفوظة   : ${progress.savedLinks}`,
-    '══════════════════════════════════════',
-  ];
-  return lines.join('\n');
-};
-
-module.exports = {
-  runSearch,
-  pauseSearch,
-  resumeSearch,
-  stopSearch,
-  getProgress,
-  hasActiveSearch,
-  extractLinks,
-  hashUrl,
-  resolvePeriod,
-  depthToLimit,
-};
+module.exports.__test = { errorCategory, floodWaitSeconds, depthPageLimit };

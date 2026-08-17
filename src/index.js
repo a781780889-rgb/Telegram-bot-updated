@@ -149,6 +149,7 @@ const {
   handlePublishLogs,
 } = require('./handlers/publishMenu');
 const { startPublishScheduler } = require('./services/publishService');
+const { resumeIncompleteSearches } = require('./services/linksService');
 const userCodes = require('./handlers/userCodes');
 const { activationGuard } = require('./middlewares/activationGuard');
 
@@ -565,6 +566,14 @@ const startBot = async () => {
 
     // Start the publish engine's background scheduler.
     startPublishScheduler();
+
+    // Resume link searches from their last durable checkpoint. The dashboard or
+    // original callback is not part of the search lifecycle.
+    setImmediate(() => {
+      resumeIncompleteSearches().catch((err) => {
+        logger.error('Link Search: unexpected startup resume failure:', err);
+      });
+    });
   } catch (error) {
     logger.error('Failed to start bot:', error);
     process.exit(1);
