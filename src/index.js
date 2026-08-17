@@ -150,6 +150,7 @@ const {
 } = require('./handlers/publishMenu');
 const { startPublishScheduler } = require('./services/publishService');
 const { resumeIncompleteSearches } = require('./services/linksService');
+const { createDatabaseBackup } = require('./database/db');
 const userCodes = require('./handlers/userCodes');
 const { activationGuard } = require('./middlewares/activationGuard');
 
@@ -554,6 +555,13 @@ const startBot = async () => {
     const botInfo = await bot.telegram.getMe();
     logger.info(`Bot started successfully: @${botInfo.username} (ID: ${botInfo.id})`);
     logger.info('Bot is ready to receive messages.');
+
+    try {
+      const backupPath = createDatabaseBackup('startup');
+      if (backupPath) logger.info(`Persistence backup created at startup: ${backupPath}`);
+    } catch (backupError) {
+      logger.error('Persistence backup failed at startup; continuing without destructive recovery:', backupError);
+    }
 
     // Restore all saved accounts after the bot is fully online.
     // Running in setImmediate ensures the bot's polling loop has started

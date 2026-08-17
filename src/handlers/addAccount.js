@@ -327,7 +327,8 @@ const finalizeLogin = async (ctx, userId, accountId, phone, result) => {
   const { sessionFile, encryptedSession } = telegramClient.saveSession(
     accountId,
     phone,
-    sessionString
+    sessionString,
+    userId
   );
 
   // Update DB with full user info

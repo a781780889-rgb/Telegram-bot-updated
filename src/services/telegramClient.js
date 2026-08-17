@@ -435,12 +435,16 @@ const verifyPassword = async (userId, phone, password) => {
 
 // ─── Session persistence ──────────────────────────────────────────────────────
 
-const saveSession = (accountId, phone, sessionString) => {
+const saveSession = (accountId, phone, sessionString, userId = null) => {
   const encryptedSession = encrypt(sessionString);
   const safePhone        = phone.replace(/[^0-9]/g, '');
   const sessionFile      = path.join(sessionsDir, `${safePhone}_${accountId}.enc`);
 
-  fs.writeFileSync(sessionFile, encryptedSession, 'utf-8');
+  fs.writeFileSync(sessionFile, encryptedSession, 'utf-8', { mode: 0o600 });
+  try {
+    const { auditQueries } = require('../database/db');
+    auditQueries.add({ userId, accountId, action: 'SAVE_SESSION', status: 'success', metadata: { sessionFile: path.basename(sessionFile) } });
+  } catch (_) {}
   logger.info(`Session saved for account ${accountId} → ${sessionFile}`);
 
   return { sessionFile, encryptedSession };
@@ -455,7 +459,11 @@ const restoreSessionFile = (account) => {
   if (fs.existsSync(canonicalPath)) return canonicalPath;
 
   try {
-    fs.writeFileSync(canonicalPath, account.encrypted_session, 'utf-8');
+    fs.writeFileSync(canonicalPath, account.encrypted_session, { encoding: 'utf-8', mode: 0o600 });
+    try {
+      const { auditQueries } = require('../database/db');
+      auditQueries.add({ accountId: account.id, userId: account.user_id, action: 'RESTORE_SESSION_FILE', status: 'success', metadata: { sessionFile: path.basename(canonicalPath) } });
+    } catch (_) {}
     logger.info(`Session Restore: file recreated for account ${account.id}`);
     return canonicalPath;
   } catch (error) {
@@ -530,6 +538,10 @@ const deleteSessionFile = (sessionFile) => {
   try {
     if (sessionFile && fs.existsSync(sessionFile)) {
       fs.unlinkSync(sessionFile);
+      try {
+        const { auditQueries } = require('../database/db');
+        auditQueries.add({ accountId: null, action: 'DELETE_SESSION_FILE', status: 'success', metadata: { sessionFile: path.basename(sessionFile), explicit: true } });
+      } catch (_) {}
       logger.info(`Session file deleted: ${sessionFile}`);
     }
   } catch (error) {

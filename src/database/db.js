@@ -6,6 +6,7 @@ const logger = require('../utils/logger');
 const persistentRoot = process.env.PERSISTENT_DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH;
 const dbPath = process.env.DB_PATH || (persistentRoot ? path.join(persistentRoot, 'accounts.db') : './data/accounts.db');
 const dbDir = path.dirname(dbPath);
+const backupRoot = process.env.DATA_BACKUP_DIR || path.join(dbDir, 'backups');
 
 if (!fs.existsSync(dbDir)) {
   fs.mkdirSync(dbDir, { recursive: true });
@@ -13,12 +14,43 @@ if (!fs.existsSync(dbDir)) {
 
 let db;
 
+const createDatabaseBackup = (label = 'runtime') => {
+  if (!fs.existsSync(dbPath) || fs.statSync(dbPath).size === 0) return null;
+  fs.mkdirSync(backupRoot, { recursive: true });
+  try { db?.pragma('wal_checkpoint(PASSIVE)'); } catch (_) {}
+  const safeLabel = String(label).replace(/[^a-zA-Z0-9_-]/g, '_');
+  const backupPath = path.join(backupRoot, `accounts-${safeLabel}-${new Date().toISOString().replace(/[:.]/g, '-')}.db`);
+  fs.copyFileSync(dbPath, backupPath);
+  for (const suffix of ['-wal', '-shm']) {
+    const sidecar = `${dbPath}${suffix}`;
+    if (fs.existsSync(sidecar)) fs.copyFileSync(sidecar, `${backupPath}${suffix}`);
+  }
+  return backupPath;
+};
+
+const createPreMigrationBackup = () => createDatabaseBackup('pre-migration');
+
 const getDb = () => {
   if (!db) {
+    const existingDatabase = fs.existsSync(dbPath) && fs.statSync(dbPath).size > 0;
+    if (existingDatabase) {
+      try {
+        const backupPath = createPreMigrationBackup();
+        if (backupPath) logger.info(`Database backup created before schema initialization: ${backupPath}`);
+      } catch (error) {
+        throw new Error(`Database backup failed; initialization stopped to protect existing data: ${error.message}`);
+      }
+    }
     db = new Database(dbPath);
-    db.pragma('journal_mode = WAL');
-    db.pragma('foreign_keys = ON');
-    initializeSchema();
+    try {
+      db.pragma('journal_mode = WAL');
+      db.pragma('foreign_keys = ON');
+      initializeSchema();
+    } catch (error) {
+      try { db.close(); } catch (_) {}
+      db = null;
+      throw error;
+    }
   }
   return db;
 };
@@ -147,6 +179,40 @@ const runMigrations = (database) => {
     }
     db.exec("UPDATE bot_users SET activation_status = CASE WHEN is_activated=1 THEN 'active' ELSE 'inactive' END WHERE activation_status IS NULL OR activation_status=''");
   });
+
+  // ── v5: Durable audit trail for sensitive persistence operations ─────────────
+  apply(5, 'add_persistence_audit_log', (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS persistence_audit_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT,
+        account_id INTEGER,
+        action TEXT NOT NULL,
+        actor TEXT,
+        status TEXT NOT NULL,
+        error TEXT,
+        metadata TEXT,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_persistence_audit_user ON persistence_audit_logs(user_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_persistence_audit_account ON persistence_audit_logs(account_id, created_at);
+    `);
+  });
+
+  // ── v6: Prevent duplicate Telegram identities without deleting legacy rows ───
+  apply(6, 'unique_telegram_account_identity', (db) => {
+    const duplicates = db.prepare(`
+      SELECT user_id, telegram_id, COUNT(*) AS count
+      FROM accounts
+      WHERE telegram_id IS NOT NULL AND telegram_id != ''
+      GROUP BY user_id, telegram_id HAVING COUNT(*) > 1
+    `).all();
+    if (duplicates.length) {
+      throw new Error(`Unsafe duplicate Telegram identities detected (${duplicates.length}); migration stopped without deleting data.`);
+    }
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_user_telegram_unique
+      ON accounts(user_id, telegram_id) WHERE telegram_id IS NOT NULL AND telegram_id != ''`);
+  });
 };
 
 // ─── Schema initializer (called once on first getDb()) ────────────────────────
@@ -189,6 +255,36 @@ const initializeSchema = () => {
 
 // ─── Account Queries ──────────────────────────────────────────────────────────
 
+const safeMetadata = (metadata = {}) => {
+  const blocked = /(session|token|secret|password|api[_-]?hash|api[_-]?id)/i;
+  return Object.fromEntries(Object.entries(metadata).filter(([key]) => !blocked.test(key)));
+};
+
+const auditPersistence = (details = {}) => {
+  try {
+    getDb().prepare(`
+      INSERT INTO persistence_audit_logs (user_id, account_id, action, actor, status, error, metadata)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(details.userId == null ? null : String(details.userId), details.accountId ?? null,
+      details.action || 'UNKNOWN', details.actor == null ? null : String(details.actor),
+      details.status || 'success', details.error ? String(details.error).slice(0, 1000) : null,
+      JSON.stringify(safeMetadata(details.metadata)));
+  } catch (error) {
+    logger.warn(`Persistence audit write failed for ${details.action || 'UNKNOWN'}: ${error.message}`);
+  }
+};
+
+const auditQueries = {
+  add: auditPersistence,
+  list: ({ userId, accountId, limit = 100 } = {}) => {
+    const conditions = []; const params = [];
+    if (userId != null) { conditions.push('user_id=?'); params.push(String(userId)); }
+    if (accountId != null) { conditions.push('account_id=?'); params.push(accountId); }
+    params.push(Math.min(Math.max(Number(limit) || 100, 1), 1000));
+    return getDb().prepare(`SELECT * FROM persistence_audit_logs ${conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''} ORDER BY created_at DESC, id DESC LIMIT ?`).all(...params);
+  },
+};
+
 const accountQueries = {
   /**
    * Insert a new account row or reset the status of an existing one.
@@ -213,7 +309,8 @@ const accountQueries = {
         updated_at    = CURRENT_TIMESTAMP
       RETURNING id
     `);
-    const row = stmt.get(userId, phone);
+    const row = stmt.get(String(userId), String(phone));
+    auditPersistence({ userId, accountId: row.id, action: 'UPSERT_ACCOUNT', actor: userId, status: 'success', metadata: { phone: String(phone).slice(-4) } });
     return row.id;
   },
 
@@ -244,7 +341,9 @@ const accountQueries = {
     const stmt = getDb().prepare(
       `UPDATE accounts SET ${fields.join(', ')} WHERE id = ?`
     );
-    return stmt.run(...values);
+    const result = stmt.run(...values);
+    auditPersistence({ userId: getDb().prepare('SELECT user_id FROM accounts WHERE id=?').get(id)?.user_id, accountId: id, action: status === 'connected' ? 'RECONNECT' : 'UPDATE_ACCOUNT_STATUS', actor: null, status: result.changes ? 'success' : 'not_found', error: result.changes ? null : 'account_not_found', metadata: { accountStatus: status } });
+    return result;
   },
 
   getByUserIdAndPhone: (userId, phone) => {
@@ -266,9 +365,9 @@ const accountQueries = {
   },
 
   deleteById: (id, userId) => {
-    return getDb()
-      .prepare('DELETE FROM accounts WHERE id = ? AND user_id = ?')
-      .run(id, userId);
+    const result = getDb().prepare('DELETE FROM accounts WHERE id = ? AND user_id = ?').run(id, String(userId));
+    auditPersistence({ userId, accountId: id, action: 'DELETE_ACCOUNT', actor: userId, status: result.changes ? 'success' : 'not_found', error: result.changes ? null : 'account_not_found' });
+    return result;
   },
 
   getStatsByUserId: (userId) => {
@@ -320,7 +419,9 @@ const botUserQueries = {
         first_name = excluded.first_name,
         last_seen  = CURRENT_TIMESTAMP
     `);
-    return stmt.run(String(telegramUserId), username || null, firstName || null);
+    const result = stmt.run(String(telegramUserId), username || null, firstName || null);
+    auditPersistence({ userId: telegramUserId, action: 'UPSERT_USER', actor: telegramUserId, status: 'success', metadata: { username: username || null } });
+    return result;
   },
 
   getActivationStatus: (telegramUserId) => {
@@ -331,22 +432,29 @@ const botUserQueries = {
     if (!row || row.is_activated !== 1) return { activated: false, reason: 'not_activated', row };
     if (row.activation_expires_at && new Date(row.activation_expires_at).getTime() <= Date.now()) {
       getDb().prepare(`UPDATE bot_users SET is_activated=0, activation_status='expired', deactivated_at=CURRENT_TIMESTAMP WHERE telegram_user_id=?`).run(String(telegramUserId));
+      auditPersistence({ userId: telegramUserId, action: 'EXPIRE_ACTIVATION', actor: 'system', status: 'success' });
       return { activated: false, reason: 'expired', row: { ...row, is_activated: 0, activation_status: 'expired' } };
     }
     return { activated: true, reason: 'active', row: { ...row, activation_status: 'active' } };
   },
 
-  activate: (telegramUserId, codeId, expiresAt) => getDb().prepare(`
-    INSERT INTO bot_users (telegram_user_id, is_activated, activation_status, activated_at, activation_code_id, activation_expires_at, last_seen)
-    VALUES (?, 1, 'active', CURRENT_TIMESTAMP, ?, ?, CURRENT_TIMESTAMP)
-    ON CONFLICT(telegram_user_id) DO UPDATE SET
-      is_activated=1, activation_status='active', activated_at=CURRENT_TIMESTAMP, activation_code_id=excluded.activation_code_id,
-      activation_expires_at=excluded.activation_expires_at, deactivated_at=NULL, last_seen=CURRENT_TIMESTAMP
-  `).run(String(telegramUserId), codeId, expiresAt),
+  activate: (telegramUserId, codeId, expiresAt) => {
+    const result = getDb().prepare(`
+      INSERT INTO bot_users (telegram_user_id, is_activated, activation_status, activated_at, activation_code_id, activation_expires_at, last_seen)
+      VALUES (?, 1, 'active', CURRENT_TIMESTAMP, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(telegram_user_id) DO UPDATE SET
+        is_activated=1, activation_status='active', activated_at=CURRENT_TIMESTAMP, activation_code_id=excluded.activation_code_id,
+        activation_expires_at=excluded.activation_expires_at, deactivated_at=NULL, last_seen=CURRENT_TIMESTAMP
+    `).run(String(telegramUserId), codeId, expiresAt);
+    auditPersistence({ userId: telegramUserId, action: 'ACTIVATE_USER', actor: telegramUserId, status: 'success', metadata: { codeId, hasExpiry: Boolean(expiresAt) } });
+    return result;
+  },
 
-  deactivate: (telegramUserId) => getDb().prepare(`
-    UPDATE bot_users SET is_activated=0, activation_status='inactive', deactivated_at=CURRENT_TIMESTAMP WHERE telegram_user_id=?
-  `).run(String(telegramUserId)),
+  deactivate: (telegramUserId) => {
+    const result = getDb().prepare(`UPDATE bot_users SET is_activated=0, activation_status='inactive', deactivated_at=CURRENT_TIMESTAMP WHERE telegram_user_id=?`).run(String(telegramUserId));
+    auditPersistence({ userId: telegramUserId, action: 'DEACTIVATE_USER', actor: telegramUserId, status: result.changes ? 'success' : 'not_found' });
+    return result;
+  },
 
   listActivationUsers: (activated) => getDb().prepare(`
     SELECT telegram_user_id, username, first_name, is_activated, activated_at, activation_expires_at, last_seen
@@ -402,4 +510,7 @@ module.exports = {
   botUserQueries,
   getAllAccountsWithSession,
   getBotUserIds,
+  auditQueries,
+  createPreMigrationBackup,
+  createDatabaseBackup,
 };
