@@ -55,6 +55,36 @@ const assertActiveSubscriptionsPreserved = (database, snapshot) => {
   }
 };
 
+const captureTelegramAccounts = (database) => {
+  try {
+    const table = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='accounts'").get();
+    if (!table) return null;
+    return new Map(database.prepare(`
+      SELECT id, user_id, phone, encrypted_session, session_file
+      FROM accounts ORDER BY id
+    `).all().map((account) => [String(account.id), account]));
+  } catch (_) {
+    return null;
+  }
+};
+
+const assertTelegramAccountsPreserved = (database, snapshot) => {
+  if (!snapshot || snapshot.size === 0) return;
+  const lost = [];
+  for (const [id, before] of snapshot.entries()) {
+    const after = database.prepare(`
+      SELECT id, user_id, phone, encrypted_session, session_file
+      FROM accounts WHERE id = ?
+    `).get(Number(id));
+    if (!after || after.user_id !== before.user_id || after.phone !== before.phone || after.encrypted_session !== before.encrypted_session) {
+      lost.push(id);
+    }
+  }
+  if (lost.length) {
+    throw new Error(`Telegram account integrity check failed for ${lost.length} account(s): update would remove or alter saved account sessions`);
+  }
+};
+
 const getDb = () => {
   if (!db) {
     const existingDatabase = fs.existsSync(dbPath) && fs.statSync(dbPath).size > 0;
@@ -68,11 +98,13 @@ const getDb = () => {
     }
     db = new Database(dbPath);
     const activeSubscriptionsBeforeMigration = captureActiveSubscriptions(db);
+    const telegramAccountsBeforeMigration = captureTelegramAccounts(db);
     try {
       db.pragma('journal_mode = WAL');
       db.pragma('foreign_keys = ON');
       initializeSchema();
       assertActiveSubscriptionsPreserved(db, activeSubscriptionsBeforeMigration);
+      assertTelegramAccountsPreserved(db, telegramAccountsBeforeMigration);
     } catch (error) {
       try { db.close(); } catch (_) {}
       db = null;
