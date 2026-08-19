@@ -19,7 +19,8 @@ const { encrypt, decrypt, maskPhone } = require('../utils/encryption');
 // ─── Directory bootstrap ──────────────────────────────────────────────────────
 
 const persistentRoot = process.env.PERSISTENT_DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH;
-const sessionsDir = process.env.SESSIONS_DIR || (persistentRoot ? path.join(persistentRoot, 'sessions') : './sessions');
+// SESSIONS_PATH is canonical; SESSIONS_DIR remains supported for existing deployments.
+const sessionsDir = process.env.SESSIONS_PATH || process.env.SESSIONS_DIR || (persistentRoot ? path.join(persistentRoot, 'sessions') : './data/sessions');
 if (!fs.existsSync(sessionsDir)) {
   fs.mkdirSync(sessionsDir, { recursive: true });
 }

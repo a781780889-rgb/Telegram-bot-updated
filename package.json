@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
+    "predeploy": "node scripts/predeploy-check.js",
     "test": "node test/userCodes.integration.js"
   },
   "dependencies": {

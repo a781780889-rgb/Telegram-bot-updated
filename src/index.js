@@ -164,11 +164,12 @@ const {
 } = require('./handlers/publishMenu');
 const { startPublishScheduler } = require('./services/publishService');
 const { resumeIncompleteSearches } = require('./services/linksService');
-const { createDatabaseBackup } = require('./database/db');
+const { createDatabaseBackup, createPersistenceBackup, closeDb } = require('./database/db');
 const userCodes = require('./handlers/userCodes');
 const { activationGuard } = require('./middlewares/activationGuard');
 
 const { restoreAllAccounts } = require('./services/sessionRestoreService');
+const { getPersistenceHealth, formatPersistenceHealth } = require('./services/persistenceHealth');
 
 // ─── Validate required environment variables ──────────────────────────────────
 
@@ -211,6 +212,16 @@ bot.command('start', handleStart);
 bot.command('debug', async (ctx) => {
   const userId = ctx.from.id;
   await ctx.reply(`🔍 *معلومات التصحيح:*\n\n🆔 معرفك: \`${userId}\`\n⚙️ الحالة: متصل ويعمل`, { parse_mode: 'Markdown' });
+});
+bot.command('health', async (ctx) => {
+  const admins = new Set(String(process.env.ADMIN_TELEGRAM_IDS || '').split(',').map((id) => id.trim()).filter(Boolean));
+  if (!admins.has(String(ctx.from.id))) return ctx.reply('هذا الأمر متاح للمسؤول فقط.');
+  try {
+    return ctx.reply(formatPersistenceHealth(getPersistenceHealth()), { parse_mode: 'Markdown' });
+  } catch (error) {
+    logger.error(`[HEALTH] failed: ${error.message}`);
+    return ctx.reply('❌ فشل فحص سلامة التخزين. راجع السجلات.');
+  }
 });
 bot.command('menu', async (ctx) => {
   await ctx.reply('القائمة الرئيسية:', require('./utils/keyboards').mainMenuKeyboard(ctx.from?.id));
@@ -539,6 +550,15 @@ const shutdown = async (signal) => {
     logger.error('Error during shutdown:', error);
   }
 
+  try {
+    const backupPath = createPersistenceBackup(`shutdown-${signal}`);
+    if (backupPath) logger.info(`[BACKUP] Shutdown persistence backup completed: ${JSON.stringify(backupPath)}`);
+    closeDb({ backup: false });
+    logger.info('[DATABASE] SQLite connection closed');
+  } catch (error) {
+    logger.error(`[DATABASE] Failed to close safely: ${error.message}`);
+  }
+
   bot.stop(signal);
   logger.info('Bot stopped');
   process.exit(0);
@@ -559,7 +579,7 @@ const startBot = async () => {
     const MAX_LAUNCH_ATTEMPTS = 4;
     for (let attempt = 1; attempt <= MAX_LAUNCH_ATTEMPTS; attempt++) {
       try {
-        await bot.launch({ dropPendingUpdates: true });
+        await bot.launch({ dropPendingUpdates: false });
         break; // نجح الإطلاق — نخرج من الحلقة
       } catch (launchErr) {
         const is409 =
@@ -583,8 +603,8 @@ const startBot = async () => {
     logger.info('Bot is ready to receive messages.');
 
     try {
-      const backupPath = createDatabaseBackup('startup');
-      if (backupPath) logger.info(`Persistence backup created at startup: ${backupPath}`);
+      const backupPath = createPersistenceBackup('startup');
+      if (backupPath) logger.info(`[BACKUP] Persistence backup created at startup: ${JSON.stringify(backupPath)}`);
     } catch (backupError) {
       logger.error('Persistence backup failed at startup; continuing without destructive recovery:', backupError);
     }

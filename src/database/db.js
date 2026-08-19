@@ -4,9 +4,12 @@ const fs = require('fs');
 const logger = require('../utils/logger');
 
 const persistentRoot = process.env.PERSISTENT_DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH;
-const dbPath = process.env.DB_PATH || (persistentRoot ? path.join(persistentRoot, 'accounts.db') : './data/accounts.db');
+// DATABASE_PATH is the canonical name; DB_PATH remains supported for compatibility.
+const configuredDbPath = process.env.DATABASE_PATH || process.env.DB_PATH;
+const dbPath = configuredDbPath || (persistentRoot ? path.join(persistentRoot, 'database', 'bot.db') : './data/database/bot.db');
 const dbDir = path.dirname(dbPath);
-const backupRoot = process.env.DATA_BACKUP_DIR || path.join(dbDir, 'backups');
+const backupRoot = process.env.BACKUP_PATH || process.env.DATA_BACKUP_DIR || (persistentRoot ? path.join(persistentRoot, 'backups') : path.join(dbDir, 'backups'));
+const sessionsPath = process.env.SESSIONS_PATH || process.env.SESSIONS_DIR || (persistentRoot ? path.join(persistentRoot, 'sessions') : './data/sessions');
 
 if (!fs.existsSync(dbDir)) {
   fs.mkdirSync(dbDir, { recursive: true });
@@ -28,7 +31,17 @@ const createDatabaseBackup = (label = 'runtime') => {
   return backupPath;
 };
 
-const createPreMigrationBackup = () => createDatabaseBackup('pre-migration');
+const createPersistenceBackup = (label = 'runtime') => {
+  const databaseBackup = createDatabaseBackup(label);
+  if (!databaseBackup) return null;
+  const safeLabel = String(label).replace(/[^a-zA-Z0-9_-]/g, '_');
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const sessionBackup = path.join(backupRoot, `sessions-${safeLabel}-${timestamp}`);
+  if (fs.existsSync(sessionsPath)) fs.cpSync(sessionsPath, sessionBackup, { recursive: true, errorOnExist: false });
+  return { database: databaseBackup, sessions: fs.existsSync(sessionBackup) ? sessionBackup : null };
+};
+
+const createPreMigrationBackup = () => createPersistenceBackup('pre-migration');
 
 // Capture active subscriptions before schema work and verify them afterwards.
 // A code update must never turn an active subscription off as a side effect.
@@ -563,6 +576,15 @@ const getBotUserIds = () => {
     .map((r) => r.telegram_user_id);
 };
 
+const closeDb = ({ backup = true, label = 'shutdown' } = {}) => {
+  if (!db) return null;
+  let backupPath = null;
+  if (backup) backupPath = createDatabaseBackup(label);
+  db.close();
+  db = null;
+  return backupPath;
+};
+
 module.exports = {
   getDb,
   accountQueries,
@@ -572,4 +594,6 @@ module.exports = {
   auditQueries,
   createPreMigrationBackup,
   createDatabaseBackup,
+  createPersistenceBackup,
+  closeDb,
 };
