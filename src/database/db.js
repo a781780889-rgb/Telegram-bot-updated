@@ -30,6 +30,31 @@ const createDatabaseBackup = (label = 'runtime') => {
 
 const createPreMigrationBackup = () => createDatabaseBackup('pre-migration');
 
+// Capture active subscriptions before schema work and verify them afterwards.
+// A code update must never turn an active subscription off as a side effect.
+const captureActiveSubscriptions = (database) => {
+  try {
+    const table = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='bot_users'").get();
+    if (!table) return null;
+    const columns = database.prepare('PRAGMA table_info(bot_users)').all().map((column) => column.name);
+    if (!columns.includes('is_activated')) return null;
+    return new Set(database.prepare('SELECT telegram_user_id FROM bot_users WHERE is_activated = 1').all().map((row) => String(row.telegram_user_id)));
+  } catch (_) {
+    return null;
+  }
+};
+
+const assertActiveSubscriptionsPreserved = (database, snapshot) => {
+  if (!snapshot || snapshot.size === 0) return;
+  const missing = [...snapshot].filter((telegramUserId) => {
+    const row = database.prepare('SELECT is_activated FROM bot_users WHERE telegram_user_id = ?').get(telegramUserId);
+    return !row || row.is_activated !== 1;
+  });
+  if (missing.length) {
+    throw new Error(`Subscription integrity check failed for ${missing.length} active user(s): migration would deactivate subscriptions`);
+  }
+};
+
 const getDb = () => {
   if (!db) {
     const existingDatabase = fs.existsSync(dbPath) && fs.statSync(dbPath).size > 0;
@@ -42,10 +67,12 @@ const getDb = () => {
       }
     }
     db = new Database(dbPath);
+    const activeSubscriptionsBeforeMigration = captureActiveSubscriptions(db);
     try {
       db.pragma('journal_mode = WAL');
       db.pragma('foreign_keys = ON');
       initializeSchema();
+      assertActiveSubscriptionsPreserved(db, activeSubscriptionsBeforeMigration);
     } catch (error) {
       try { db.close(); } catch (_) {}
       db = null;
