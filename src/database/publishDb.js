@@ -175,6 +175,15 @@ const logQueries = {
     const success = db.prepare("SELECT COUNT(*) as c FROM publish_logs WHERE user_id = ? AND task_id = ? AND result = 'success'").get(userId, taskId).c;
     const failed = db.prepare("SELECT COUNT(*) as c FROM publish_logs WHERE user_id = ? AND task_id = ? AND result = 'failed'").get(userId, taskId).c;
     return { success, failed };
+  },
+  getStatsSummary: (userId) => {
+    const row = getDb().prepare(`
+      SELECT
+        COALESCE(SUM(CASE WHEN result = 'success' THEN 1 ELSE 0 END), 0) AS success,
+        COALESCE(SUM(CASE WHEN result = 'failed' THEN 1 ELSE 0 END), 0) AS failed
+      FROM publish_logs WHERE user_id = ?
+    `).get(String(userId));
+    return { success: row.success, failed: row.failed };
   }
 };
 

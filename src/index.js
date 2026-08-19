@@ -145,8 +145,22 @@ const {
   handleAdsLibrary,
   handleAdAddStart,
   handleAdView,
+  handleAdDelete,
+  handleAdConfirmDelete,
+  handleAdEdit,
+  handleAccountsSelect,
+  handleAccountToggle,
+  handleAccountsConfirm,
+  beginPublish,
+  handleAdSelect,
+  handleFlowNext,
+  handleTargetToggle,
+  handleFlowConfirm,
+  handlePublishFolders,
+  handleFolderLink,
   handleDashboard,
   handlePublishLogs,
+  handlePublishSettings,
 } = require('./handlers/publishMenu');
 const { startPublishScheduler } = require('./services/publishService');
 const { resumeIncompleteSearches } = require('./services/linksService');
@@ -418,13 +432,25 @@ bot.action('folders_edit_groups_per_folder', handleFoldersEditGroupsPerFolder);
 bot.action('publish_menu', handlePublishMenu);
 bot.action('publish_ads_library', handleAdsLibrary);
 bot.action('publish_ad_add', handleAdAddStart);
+bot.action('publish_direct_start', async (ctx) => beginPublish(ctx, 'direct'));
+bot.action('publish_schedule_start', async (ctx) => beginPublish(ctx, 'scheduled'));
+bot.action('publish_accounts_select', handleAccountsSelect);
+bot.action('publish_accounts_confirm', handleAccountsConfirm);
+bot.action('publish_settings', handlePublishSettings);
 bot.action('publish_dashboard', handleDashboard);
 bot.action('publish_dashboard_refresh', handleDashboard);
 bot.action('publish_logs', handlePublishLogs);
-
-bot.action(/^publish_ad_view_(\d+)$/, async (ctx) => {
-  await handleAdView(ctx, parseInt(ctx.match[1], 10));
-});
+bot.action('publish_flow_next', handleFlowNext);
+bot.action('publish_flow_confirm', handleFlowConfirm);
+bot.action('publish_folders_start', handlePublishFolders);
+bot.action(/^publish_folder_link_(\d+)$/, async (ctx) => handleFolderLink(ctx, parseInt(ctx.match[1], 10)));
+bot.action(/^publish_ad_view_(\d+)$/, async (ctx) => handleAdView(ctx, parseInt(ctx.match[1], 10)));
+bot.action(/^publish_ad_delete_(\d+)$/, async (ctx) => handleAdDelete(ctx, parseInt(ctx.match[1], 10)));
+bot.action(/^publish_ad_confirm_delete_(\d+)$/, async (ctx) => handleAdConfirmDelete(ctx, parseInt(ctx.match[1], 10)));
+bot.action(/^publish_ad_edit_(\d+)$/, async (ctx) => handleAdEdit(ctx, parseInt(ctx.match[1], 10)));
+bot.action(/^publish_account_(\d+)$/, async (ctx) => handleAccountToggle(ctx, parseInt(ctx.match[1], 10)));
+bot.action(/^publish_ad_select_(\d+)$/, async (ctx) => handleAdSelect(ctx, parseInt(ctx.match[1], 10)));
+bot.action(/^publish_target_(\d+)$/, async (ctx) => handleTargetToggle(ctx, parseInt(ctx.match[1], 10)));
 
 bot.action(/^folder_detail_(\d+)$/, async (ctx) => {
   await handleFolderDetail(ctx, parseInt(ctx.match[1], 10));

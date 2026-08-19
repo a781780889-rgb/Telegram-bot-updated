@@ -16,7 +16,7 @@ const TEXT_INPUT_STEPS = new Set([
 ]);
 
 const states = new Map();
-const TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+const TIMEOUT_MS = 30 * 60 * 1000;
 
 const getWizardState = (userId) => {
   const state = states.get(String(userId));
@@ -36,10 +36,13 @@ const setWizardState = (userId, step, data = {}) => {
   });
 };
 
-const resetWizard = (userId) => {
-  states.delete(String(userId));
+const updateWizardData = (userId, data = {}) => {
+  const current = getWizardState(userId) || { step: WIZARD_STEPS.IDLE, data: {} };
+  setWizardState(userId, current.step, data);
+  return getWizardState(userId);
 };
 
+const resetWizard = (userId) => states.delete(String(userId));
 const isAwaitingTextInput = (userId) => {
   const state = getWizardState(userId);
   return state && TEXT_INPUT_STEPS.has(state.step);
@@ -49,6 +52,7 @@ module.exports = {
   WIZARD_STEPS,
   getWizardState,
   setWizardState,
+  updateWizardData,
   resetWizard,
   isAwaitingTextInput,
 };
